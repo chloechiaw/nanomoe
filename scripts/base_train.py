@@ -14,6 +14,7 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
+import re
 import json
 import time
 import math
@@ -29,7 +30,7 @@ from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -57,6 +58,9 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 # Mixture of Experts (n-expert=1 => dense, i.e. upstream nanochat)
 parser.add_argument("--n-expert", type=int, default=1, help="number of MoE experts per layer (1 = dense MLP)")
 parser.add_argument("--top-k", type=int, default=2, help="experts activated per token (ignored when --n-expert=1)")
+parser.add_argument("--moe-dispatch", type=str, default="loop", choices=["loop","batched","compiled","permute","grouped"],
+                    help="expert execution: per-expert python loop, or one batched bmm over all experts")
+parser.add_argument("--moe-capacity-factor", type=float, default=1.25, help="only for --moe-dispatch=compiled: per-expert slots as a multiple of the balanced share")
 parser.add_argument("--expert-load-every", type=int, default=100, help="log per-expert token counts every N steps (-1 = disable)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -74,6 +78,7 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--resume", action="store_true", help="resume from the latest checkpoint in the model-tag dir (shorthand for --resume-from-step <last>)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -85,6 +90,18 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+# Where checkpoints for this run live. Resolved here (not further down with the model) because
+# --resume has to know the step number before wandb.init, so the resumed run can rejoin the
+# same wandb run rather than starting a second, disconnected one.
+base_dir = get_base_dir()
+output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+if args.resume:
+    assert args.resume_from_step == -1, "pass either --resume or --resume-from-step, not both"
+    last = find_last_step(checkpoint_dir)  # asserts if the dir has no checkpoints
+    args.resume_from_step = last
+    print(f"--resume: latest checkpoint in {checkpoint_dir} is step {last}")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -101,9 +118,34 @@ else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
-# wandb logging init
+# wandb logging init.
+# The run id is derived from the run name so that a --resume rejoins the *same* wandb run and
+# the curves stay continuous across the restart, instead of appearing as two disjoint runs.
+# resume="allow" means: attach if that id exists, otherwise create it.
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, config=user_config)
+if use_dummy_wandb:
+    wandb_run = DummyWandb()
+else:
+    wandb_run = wandb.init(
+        project=args.wandb_project,
+        name=args.run,
+        id=re.sub(r"[^A-Za-z0-9_.-]", "-", args.run),
+        resume="allow",
+        config=user_config,
+    )
+    # Caveat on resume: the checkpoint is usually a bit behind the last step wandb saw (you
+    # save every --save-every but log every step), so the first steps after a restart replay
+    # step numbers wandb already has and it drops them. The curve picks back up once the run
+    # passes its previous high-water mark. Harmless, but it's why there can be a flat spot.
+# Print the URL ourselves: wandb's own banner scrolls away fast under Modal's log firehose,
+# and this line is easy to grep for (`modal app logs <id> | grep wandb`).
+wandb_url = wandb_run.get_url() if not use_dummy_wandb else None
+if wandb_url:
+    print0("=" * 78)
+    print0(f"wandb live dashboard: {wandb_url}")
+    print0("=" * 78)
+elif master_process:
+    print0("wandb: disabled (--run dummy). Pass --run <name> to log this run.")
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -143,7 +185,8 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
-        n_expert=args.n_expert, top_k=args.top_k,
+        n_expert=args.n_expert, top_k=args.top_k, moe_dispatch=args.moe_dispatch,
+        moe_capacity_factor=args.moe_capacity_factor,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -158,9 +201,7 @@ model.to_empty(device=device) # 2) All tensors get storage on target device but 
 model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
-base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+# (base_dir / output_dirname / checkpoint_dir were resolved up top, before wandb.init)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -438,16 +479,21 @@ while True:
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+            val = evaluate_bpb(model, val_loader, eval_steps, token_bytes, return_details=True)
+        val_bpb, val_loss = val["bpb"], val["loss"]
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
+        # modded-nanogpt-style validation line, alongside nanochat's vocab-invariant bpb
+        print0(f"step:{step}/{num_iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+               f"train_time:{total_training_time * 1000:.0f}ms step_avg:{total_training_time * 1000 / max(step, 1):.2f}ms")
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+            "val/loss": val_loss,
+            "val/min_bpb": min_val_bpb,
+        }, step=step)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -458,13 +504,32 @@ while True:
         model.eval()
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        # Report raw accuracy AND chance-adjusted (centered) score per task. Raw accuracy alone
+        # is misleading across a mixed suite: 26% on 4-way HellaSwag is chance, while the same
+        # 26% on a generative task with no chance floor would be real signal. centered =
+        # (acc - chance) / (1 - chance), so 0.0 means "learned nothing" on every task alike.
+        raw, cen = results["results"], results["centered_results"]
+        ranked = sorted(cen, key=lambda t: -cen[t])
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
+        print0(f"  {'task':34s} {'type':4s} {'raw acc':>8s} {'chance':>7s} {'centered':>9s}")
+        for t in ranked:
+            a, c = raw[t], cen[t]
+            chance = (a - c) / (1 - c) if c != 1 else 0.0  # invert the centering to recover it
+            kind = "LM" if chance < 1e-6 else "MC"         # LM tasks have a zero chance floor
+            print0(f"  {t:34s} {kind:4s} {a:8.4f} {chance:7.3f} {c:9.4f}")
+        n_signal = sum(1 for t in cen if cen[t] > 0.06)
+        print0(f"  tasks with real signal (centered > 0.06): {n_signal}/{len(cen)}")
+
+        core_log = {
             "step": step,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
+            "core/n_tasks_with_signal": n_signal,
+        }
+        for t in cen:
+            core_log[f"core_acc/{t}"] = raw[t]        # raw accuracy, comparable to published tables
+            core_log[f"core_centered/{t}"] = cen[t]   # chance-adjusted, comparable across task types
+        wandb_run.log(core_log, step=step)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -583,20 +648,34 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    step_avg_ms = total_training_time * 1000 / max(steps_done, 1)
+    print0(f"step:{step}/{num_iterations} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | step_avg: {step_avg_ms:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | train_time: {total_training_time/60:.2f}m{eta_str}")
+    if args.wandb_every > 0 and step % args.wandb_every == 0:
+        # Everything the console line prints, so every field is graphable. Note `epoch` is
+        # split into numeric parts here — wandb cannot plot the packed string.
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
+            "train/loss_raw": train_loss_f,
             "train/lrm": lrm,
             "train/dt": dt,
+            "train/train_time_ms": total_training_time * 1000,
+            "train/step_avg_ms": step_avg_ms,
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
-            "train/epoch": epoch,
+            "train/pct_done": pct_done,
+            "train/muon_momentum": muon_momentum,
+            "train/muon_weight_decay": muon_weight_decay,
+            "train/epoch": dataloader_state_dict["epoch"],
+            "train/pq_idx": dataloader_state_dict["pq_idx"],
+            "train/rg_idx": dataloader_state_dict["rg_idx"],
         }
-        wandb_run.log(log_data)
+        # step= keeps wandb's internal counter equal to the training step. Without it, logging
+        # val/train/moe separately would advance wandb's counter 2-3x per training step and
+        # every chart would share a meaningless x-axis. Same-step calls merge.
+        wandb_run.log(log_data, step=step)
 
     # once in a while: report how evenly QB is spreading tokens across experts.
     # MaxVio = (max_load - mean_load) / mean_load, the standard load-imbalance metric from the
@@ -609,12 +688,21 @@ while True:
             frac = (counts / counts.sum(dim=-1, keepdim=True))
             print0(f"step {step:05d} | expert MaxVio: mean {maxvio.mean():.4f} worst {maxvio.max():.4f} | "
                    f"layer0 share: {' '.join(f'{f:.3f}' for f in frac[0].tolist())}")
-            wandb_run.log({
+            # Per-expert share as individual scalars (averaged over MoE layers): wandb graphs
+            # these as one series per expert, which *is* the "expert load over training" plot.
+            mean_share = frac.mean(dim=0)
+            moe_log = {
                 "step": step,
                 "moe/maxvio_mean": maxvio.mean().item(),
                 "moe/maxvio_worst": maxvio.max().item(),
-                "moe/expert_share": frac.tolist(),
-            })
+                "moe/share_min": mean_share.min().item(),
+                "moe/share_max": mean_share.max().item(),
+            }
+            for e in range(mean_share.numel()):
+                moe_log[f"moe/share_e{e}"] = mean_share[e].item()
+            for layer_idx in range(frac.size(0)):
+                moe_log[f"moe/maxvio_layer{layer_idx}"] = maxvio[layer_idx].item()
+            wandb_run.log(moe_log, step=step)
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)

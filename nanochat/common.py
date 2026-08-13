@@ -219,6 +219,8 @@ class DummyWandb:
         pass
     def log(self, *args, **kwargs):
         pass
+    def get_url(self):
+        return None
     def finish(self):
         pass
 

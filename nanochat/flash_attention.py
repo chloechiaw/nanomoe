@@ -31,16 +31,20 @@ def _load_flash_attention_3():
         import os
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel, has_kernel
-        # The varunneal kernel obtains better results for H100/Hopper
-        if major == 9:
-            hf_kernel = "varunneal/flash-attention-3"
-            return get_kernel(hf_kernel).flash_attn_interface
-        else:
-            hf_kernel = "kernels-community/flash-attn3"
-            if has_kernel(hf_kernel):
+        # Upstream hardcodes varunneal/flash-attention-3 for Hopper with no fallback, but that
+        # HF org now 404s -- which silently cost us FA3 on H100 and forced SDPA (and therefore
+        # --window-pattern=L) on a GPU that FA3 targets natively. Try it, then fall through to
+        # the community build rather than giving up.
+        candidates = ["varunneal/flash-attention-3"] if major == 9 else []
+        candidates.append("kernels-community/flash-attn3")
+        for hf_kernel in candidates:
+            try:
+                if not has_kernel(hf_kernel):
+                    continue
                 return get_kernel(hf_kernel).flash_attn_interface
-            else:
-                return None
+            except Exception:
+                continue
+        return None
 
     except Exception:
         return None
