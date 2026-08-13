@@ -51,8 +51,7 @@ modal run --detach modal_app.py::train --run nanomoe-h100 --args \
 ### Evaluate
 
 ```bash
-TAG=moe-d16-h100
-modal run --detach modal_app.py::evaluate --args "--model-tag=$TAG --device-batch-size=8"
+modal run --detach modal_app.py::evaluate --args "--device-batch-size=8"
 ```
 
 Results land on the volume as `base_eval/base_model_<step>.csv`, one row per benchmark with
