@@ -33,11 +33,6 @@ def adamw_step_fused(
     eps_t: Tensor,          # () - 0-D CPU tensor, epsilon
     wd_t: Tensor,           # () - 0-D CPU tensor, weight decay
 ) -> None:
-    """
-    Fused AdamW step: weight_decay -> momentum_update -> bias_correction -> param_update
-    All in one compiled graph to eliminate Python overhead between ops.
-    The 0-D CPU tensors avoid recompilation when hyperparameter values change.
-    """
     # Some params (wte, value_embeds) are stored in bf16, so do the math in fp32 and
     # cast back at the end. MPS errors on mixed-dtype ops (CUDA promotes them), and
     # scalar arithmetic like 1 - beta2 loses all precision in bf16. compile fuses the casts.
@@ -121,11 +116,6 @@ def muon_step_fused(
     ns_steps: int,                  # 5 - number of Newton-Schulz/Polar Express iterations
     red_dim: int,                   # -1 or -2 - reduction dimension for variance
 ) -> None:
-    """
-    Fused Muon step: momentum -> polar_express -> variance_reduction -> cautious_update
-    All in one compiled graph to eliminate Python overhead between ops.
-    Some of the constants are 0-D CPU tensors to avoid recompilation when values change.
-    """
 
     # Nesterov momentum
     momentum = momentum_t.to(stacked_grads.dtype)
@@ -182,81 +172,6 @@ def muon_step_fused(
 # -----------------------------------------------------------------------------
 
 class MuonAdamW(torch.optim.Optimizer):
-    """
-    Combined optimizer: Muon for 2D matrix params, AdamW for others.
-
-    AdamW - Fused AdamW optimizer step.
-
-    Muon - MomentUm Orthogonalized by Newton-schulz
-    https://kellerjordan.github.io/posts/muon/
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - The Muon optimizer should not be used for the embedding layer, the final fully connected layer,
-    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-
-    The same class covers single GPU and distributed training. In the distributed setting
-    (a multi-rank process group is initialized), gradients are synchronized here in the
-    optimizer (nanochat does not use DDP) and optimizer states are sharded across ranks
-    (ZeRO-2 style). On a single rank, all communication is skipped and the rank owns all
-    parameters, so the sharded code paths degenerate to plain full-tensor updates.
-
-    Design Goals:
-    - Overlap communication with computation (async ops)
-    - Minimize memory by sharding optimizer states across ranks (ZeRO-2 style)
-    - Batch small tensors into single comm ops where possible
-
-    Communication Pattern (3-phase async):
-    We use a 3-phase structure to maximize overlap between communication and compute:
-
-        Phase 1: Launch all async reduce ops
-            - Kick off all reduce_scatter/all_reduce operations
-            - Don't wait - let them run in background while we continue
-
-        Phase 2: Wait for reduces, compute updates, launch gathers
-            - For each group: wait for its reduce, compute the update, launch gather
-            - By processing groups in order, earlier gathers run while later computes happen
-
-        Phase 3: Wait for gathers, copy back
-            - Wait for all gathers to complete
-            - Copy updated params back to original tensors (Muon only)
-
-    AdamW Communication (ZeRO-2 style):
-    - Small params (<1024 elements): all_reduce gradients, update full param on each rank.
-      Optimizer state is replicated but these params are tiny (scalars, biases).
-    - Large params: reduce_scatter gradients so each rank gets 1/N of the grad, update
-      only that slice, then all_gather the updated slices. Optimizer state (exp_avg,
-      exp_avg_sq) is sharded - each rank only stores state for its slice.
-      Requires param.shape[0] divisible by world_size.
-
-    Muon Communication (stacked + chunked):
-    - All params in a Muon group must have the same shape (caller's responsibility).
-    - Stack all K params into a single (K, *shape) tensor for efficient comm.
-    - Divide K params across N ranks: each rank "owns" ceil(K/N) params.
-    - reduce_scatter the stacked grads so each rank gets its chunk.
-    - Each rank computes Muon update only for params it owns.
-    - all_gather the updated params back to all ranks.
-    - Optimizer state (momentum_buffer, second_momentum_buffer) is sharded by chunk.
-    - Padding: if K doesn't divide evenly, we zero-pad to (ceil(K/N) * N) for comm,
-      then ignore the padding when copying back.
-
-    Buffer Reuse:
-    - For Muon, we allocate stacked_grads for reduce_scatter input, then reuse the
-      same buffer as the output for all_gather (stacked_params). This saves memory
-      since we don't need both buffers simultaneously.
-
-    Arguments:
-        param_groups: List of dicts, each containing:
-            - 'params': List of parameters
-            - 'kind': 'adamw' or 'muon'
-            - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
-            - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
-    """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
@@ -272,7 +187,6 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
-        """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
         param_infos = {}
         for p in group['params']:
             grad = p.grad
@@ -293,7 +207,6 @@ class MuonAdamW(torch.optim.Optimizer):
         return dict(param_infos=param_infos)
 
     def _reduce_muon(self, group: dict, world_size: int) -> dict:
-        """Launch async reduce op for Muon group. Returns info dict."""
         params = group['params']
         if world_size == 1:
             # Single rank: this rank owns all params, the stacked grads are the "chunk"
@@ -318,7 +231,6 @@ class MuonAdamW(torch.optim.Optimizer):
         return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
 
     def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
-        """Wait for reduce, compute AdamW updates, launch gathers for large params."""
         param_infos = info['param_infos']
         for p in group['params']:
             pinfo = param_infos[p]
@@ -360,7 +272,6 @@ class MuonAdamW(torch.optim.Optimizer):
                 gather_list.append(dict(future=future, params=None))
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
-        """Wait for reduce, compute Muon updates, launch gather."""
         if info['future'] is not None:
             info['future'].wait()
         params = group['params']
@@ -417,7 +328,6 @@ class MuonAdamW(torch.optim.Optimizer):
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
     def _finish_gathers(self, gather_list: list) -> None:
-        """Wait for all gathers and copy Muon params back."""
         for info in gather_list:
             if info["future"] is not None:
                 info["future"].wait()

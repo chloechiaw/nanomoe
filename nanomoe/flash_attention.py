@@ -21,7 +21,6 @@ import torch.nn.functional as F
 # Detection: Try to load FA3 on CUDA GPUs
 # =============================================================================
 def _load_flash_attention_3():
-    """Try to load Flash Attention 3."""
     if not torch.cuda.is_available():
         return None
     try:
@@ -50,7 +49,6 @@ _override_impl = None
 
 
 def _resolve_use_fa3():
-    """Decide once whether to use FA3, based on availability, override, and dtype."""
     if _override_impl == 'fa3':
         assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
         return True
@@ -71,10 +69,6 @@ USE_FA3 = _resolve_use_fa3()
 # SDPA helpers
 # =============================================================================
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
-    """
-    SDPA attention with sliding window support.
-    q, k, v are (B, H, T, D) format.
-    """
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
@@ -109,17 +103,6 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 # Public API: Same interface as FA3
 # =============================================================================
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
-    """
-    Flash Attention for training (no KV cache).
-
-    Args:
-        q, k, v: Tensors of shape (B, T, H, D)
-        causal: Whether to use causal masking
-        window_size: (left, right) sliding window. -1 means unlimited.
-
-    Returns:
-        Output tensor of shape (B, T, H, D)
-    """
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
@@ -134,22 +117,6 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
                             causal=False, window_size=(-1, -1)):
-    """
-    Flash Attention with KV cache for inference.
-
-    FA3 updates k_cache/v_cache in-place. Our SDPA fallback does the same.
-
-    Args:
-        q: Queries, shape (B, T_new, H, D)
-        k_cache, v_cache: Pre-allocated cache tensors, shape (B, T_max, H_kv, D)
-        k, v: New keys/values to insert, shape (B, T_new, H_kv, D)
-        cache_seqlens: Current position in cache, shape (B,) int32
-        causal: Whether to use causal masking
-        window_size: (left, right) sliding window. -1 means unlimited.
-
-    Returns:
-        Output tensor of shape (B, T_new, H, D)
-    """
     if USE_FA3:
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,

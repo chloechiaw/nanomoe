@@ -28,7 +28,6 @@ MUON_TALL_SHAPE = (64, 32)
 
 
 def make_params_and_groups(seed=1337, offset=0.0, targets=None):
-    """The menagerie: small/large AdamW params, wide/tall Muon stacks."""
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
     def rand(shape):
         base = torch.randn(shape, generator=gen, device=DEVICE) * 0.05
@@ -46,7 +45,6 @@ def make_params_and_groups(seed=1337, offset=0.0, targets=None):
 
 
 def test_adamw_matches_torch_reference():
-    """Our fused AdamW must agree with torch.optim.AdamW (both decoupled wd)."""
     hypers = dict(lr=0.01, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
     p_ours = torch.nn.Parameter(torch.randn(64, 32, device=DEVICE))
     p_ref = torch.nn.Parameter(p_ours.detach().clone())
@@ -62,7 +60,6 @@ def test_adamw_matches_torch_reference():
 
 
 def test_determinism():
-    """Two identical runs must produce bitwise identical parameters."""
     results = []
     for _ in range(2):
         params, groups = make_params_and_groups()
@@ -78,7 +75,6 @@ def test_determinism():
 
 
 def test_convergence():
-    """Optimizing distance-to-target must actually approach the target."""
     targets_params, _ = make_params_and_groups(seed=999)
     targets = [p.detach().clone() for p in targets_params]
     params, groups = make_params_and_groups(seed=999, offset=0.1) # start offset from the targets
@@ -97,11 +93,6 @@ def test_convergence():
 
 
 def test_muon_update_is_orthogonalized():
-    """
-    The very first Muon update (zero momentum state) of a full-rank gradient
-    should be (near) semi-orthogonal after the polar iteration: its nonzero
-    singular values land in a band around 1, rather than being spread out.
-    """
     p = torch.nn.Parameter(torch.zeros(MUON_WIDE_SHAPE, device=DEVICE))
     group = dict(kind="muon", params=[p], lr=1.0, momentum=0.0, ns_steps=5, beta2=1.0, weight_decay=0.0)
     opt = MuonAdamW([group])

@@ -50,8 +50,8 @@ image = (
     .apt_install("git", "build-essential")
     .pip_install("torch==2.9.1")
     .pip_install(
-        # nanochat's own dependency set (pyproject.toml), plus the two it uses but does not
-        # declare: requests (nanochat/dataset.py) and pyyaml (scripts/base_eval.py).
+        # pyproject.toml's set, plus the two it uses but does not declare:
+        # requests (nanomoe/dataset.py) and pyyaml (scripts/base_eval.py).
         "filelock>=3.19.0",
         "kernels>=0.11.7",
         "numpy>=1.26.0",
@@ -62,7 +62,6 @@ image = (
         "tiktoken>=0.11.0",
         "wandb>=0.21.3",
         "pyyaml>=6.0",
-        "matplotlib>=3.10.0",
         "pytest>=8.0.0",
     )
     .env(
@@ -217,6 +216,26 @@ TRAIN_DEFAULTS = [
     "--save-every=2500",
 ]
 
+
+
+@app.function(gpu=GPU_TYPE, volumes=VOLUMES, timeout=30 * 60)
+def smoke(args: str = ""):
+    """A few real training steps. Cheap check that the whole stack still runs before
+    committing to a long run: data, tokenizer, FA3, grouped dispatch, QB, checkpointing."""
+    argv = _merge_args(
+        TRAIN_DEFAULTS
+        + [
+            "--num-iterations=12",
+            "--total-batch-size=65536",
+            "--device-batch-size=8",
+            "--eval-every=-1",
+            "--core-metric-every=-1",
+            "--save-every=-1",
+            "--model-tag=smoke",
+        ],
+        args,
+    )
+    _run("-m", "scripts.base_train", *argv)
 
 
 @app.function(

@@ -27,13 +27,12 @@ import torch.distributed as dist
 
 from nanomoe.gpt import GPT, GPTConfig, Linear
 from nanomoe.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanomoe.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanomoe.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanomoe.tokenizer import get_tokenizer, get_token_bytes
 from nanomoe.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanomoe.loss_eval import evaluate_bpb
 from nanomoe.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
-print_banner()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -167,7 +166,6 @@ print0(f"Vocab size: {vocab_size:,}")
 # Initialize the Model
 
 def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio

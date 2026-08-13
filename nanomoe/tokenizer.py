@@ -32,7 +32,6 @@ import rustbpe
 import tiktoken
 
 class RustBPETokenizer:
-    """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
 
     def __init__(self, enc, bos_token):
         self.enc = enc
@@ -138,12 +137,6 @@ class RustBPETokenizer:
         print(f"Saved tokenizer encoding to {pickle_path}")
 
     def render_conversation(self, conversation, max_tokens=2048):
-        """
-        Tokenize a single Chat conversation (which we call a "doc" or "document" here).
-        Returns:
-        - ids: list[int] is a list of token ids of this rendered conversation
-        - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
-        """
         # ids, masks that we will return and a helper function to help build them up.
         ids, mask = [], []
         def add_tokens(token_ids, mask_val):
@@ -224,7 +217,6 @@ class RustBPETokenizer:
         return ids, mask
 
     def visualize_tokenization(self, ids, mask, with_token_id=False):
-        """Small helper function useful in debugging: visualize the tokenization of render_conversation"""
         RED = '\033[91m'
         GREEN = '\033[92m'
         RESET = '\033[0m'
@@ -239,11 +231,6 @@ class RustBPETokenizer:
         return '|'.join(tokens)
 
     def render_for_completion(self, conversation):
-        """
-        Used during Reinforcement Learning. In that setting, we want to
-        render the conversation priming the Assistant for a completion.
-        Unlike the Chat SFT case, we don't need to return the mask.
-        """
         # We have some surgery to do: we need to pop the last message (of the Assistant)
         conversation = copy.deepcopy(conversation) # avoid mutating the original
         messages = conversation["messages"]

@@ -4,6 +4,7 @@ Utilities for saving and loading model/optim/state checkpoints.
 import os
 import re
 import json
+import dataclasses
 import logging
 import torch
 
@@ -18,25 +19,6 @@ logger = logging.getLogger(__name__)
 def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
-
-def _patch_missing_config_keys(model_config_kwargs):
-    """Add default values for new config keys missing in old checkpoints."""
-    # Old models were trained with full context (no sliding window)
-    if "window_pattern" not in model_config_kwargs:
-        model_config_kwargs["window_pattern"] = "L"
-        log0(f"Patching missing window_pattern in model config to 'L'")
-
-def _patch_missing_keys(model_data, model_config):
-    """Add default values for new parameters that may be missing in old checkpoints."""
-    n_layer = model_config.n_layer
-    # resid_lambdas defaults to 1.0 (identity scaling)
-    if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
-        log0(f"Patching missing resid_lambdas in model data to 1.0")
-    # x0_lambdas defaults to 0.0 (disabled)
-    if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
-        log0(f"Patching missing x0_lambdas in model data to 0.0")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -74,13 +56,6 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
 
 
 def build_model(checkpoint_dir, step, device, phase):
-    """
-    A bunch of repetitive code to build a model from a given checkpoint.
-    Returns:
-    - base model - uncompiled, not wrapped in DDP
-    - tokenizer
-    - meta data saved during base model training
-    """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
     if device.type in {"cpu", "mps"}:
@@ -92,10 +67,16 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
-    _patch_missing_config_keys(model_config_kwargs)
+    # Drop config keys this version of GPTConfig no longer has, so checkpoints written before a
+    # field was removed still load. Without this, deleting a config field orphans every
+    # checkpoint trained with it.
+    known = {f.name for f in dataclasses.fields(GPTConfig)}
+    dropped = sorted(set(model_config_kwargs) - known)
+    if dropped:
+        log0(f"Ignoring config keys not in this GPTConfig: {dropped}")
+        model_config_kwargs = {k: v for k, v in model_config_kwargs.items() if k in known}
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
     # Load the model state
@@ -161,33 +142,6 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     return model, tokenizer, meta_data
 
 def load_model(source, *args, **kwargs):
-    model_dir = {
-        "base": "base_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
-    base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
+    assert source == "base", f"only base checkpoints exist in nanoMoE, got {source!r}"
+    checkpoints_dir = os.path.join(get_base_dir(), "base_checkpoints")
     return load_model_from_dir(checkpoints_dir, *args, **kwargs)
-
-def load_optimizer_state(source, device, rank, model_tag=None, step=None):
-    """Load just the optimizer shard for a given rank, without re-loading the model."""
-    model_dir = {
-        "base": "base_checkpoints",
-        "sft": "chatsft_checkpoints",
-        "rl": "chatrl_checkpoints",
-    }[source]
-    base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
-    if model_tag is None:
-        model_tag = find_largest_model(checkpoints_dir)
-    checkpoint_dir = os.path.join(checkpoints_dir, model_tag)
-    if step is None:
-        step = find_last_step(checkpoint_dir)
-    optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-    if not os.path.exists(optimizer_path):
-        log0(f"Optimizer checkpoint not found: {optimizer_path}")
-        return None
-    log0(f"Loading optimizer state from {optimizer_path}")
-    optimizer_data = torch.load(optimizer_path, map_location=device)
-    return optimizer_data

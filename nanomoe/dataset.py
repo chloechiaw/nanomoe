@@ -30,7 +30,6 @@ DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
 # These functions are useful utilities to other modules, can/should be imported
 
 def list_parquet_files(data_dir=None, warn_on_legacy=False):
-    """ Looks into a data dir and returns full paths to all parquet files. """
     data_dir = DATA_DIR if data_dir is None else data_dir
 
     # Legacy-supporting code due to the upgrade from FinewebEdu-100B to ClimbMix-400B
@@ -65,11 +64,6 @@ def list_parquet_files(data_dir=None, warn_on_legacy=False):
     return parquet_paths
 
 def parquets_iter_batched(split, start=0, step=1):
-    """
-    Iterate through the dataset, in batches of underlying row_groups for efficiency.
-    - split can be "train" or "val". the last parquet file will be val.
-    - start/step are useful for skipping rows in DDP. e.g. start=rank, step=world_size
-    """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
     parquet_paths = list_parquet_files()
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
@@ -82,7 +76,6 @@ def parquets_iter_batched(split, start=0, step=1):
 
 # -----------------------------------------------------------------------------
 def download_single_file(index):
-    """ Downloads a single file index, with some backoff """
 
     # Construct the local filepath for this file and skip if it already exists
     filename = index_to_filename(index)

@@ -1,7 +1,7 @@
 [project]
-name = "nanochat"
+name = "nanomoe"
 version = "0.1.0"
-description = "the minimal full-stack ChatGPT clone"
+description = "a minimal Mixture-of-Experts language model"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -18,10 +18,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "ipykernel>=7.1.0",
-    "matplotlib>=3.10.8",
     "pytest>=8.0.0",
-    "python-dotenv>=1.2.1",
 ]
 
 [tool.pytest.ini_options]

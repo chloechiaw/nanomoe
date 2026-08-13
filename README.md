@@ -61,16 +61,33 @@ modal run --detach modal_app.py::train --run nanomoe-h100 --resume --args "<same
 
 ### Evaluate
 
-```bash
-modal run --detach modal_app.py::evaluate --args "--model-tag=moe-d16-h100 --device-batch-size=8"
-```
-
-`evaluate` writes per task accuracy to
-`nanochat/base_eval/base_model_007350.csv` on the volume. Pull it down with:
+Scores ARC-Easy, PIQA and HellaSwag on the full test sets, plus train/val bits-per-byte.
+Point it at any checkpoint with `--model-tag`:
 
 ```bash
-modal volume get nano-moe-data nanochat/base_eval/base_model_007350.csv .
+TAG=moe-d16-h100
+modal run --detach modal_app.py::evaluate --args "--model-tag=$TAG --device-batch-size=8"
 ```
+
+Useful variations:
+
+```bash
+--eval core                  # benchmarks only, skip bpb
+--eval bpb                   # bpb only, ~1 min
+--max-per-task=200           # sample instead of the full test set, for a quick read
+--step=2500                  # an earlier checkpoint (default: the newest)
+```
+
+Results land on the volume as `base_eval/base_model_<step>.csv`, one row per benchmark with
+raw and chance-centered accuracy. To find and fetch them:
+
+```bash
+modal run modal_app.py::ls --path base_eval
+modal volume get nano-moe-data nanochat/base_eval/base_model_<step>.csv .
+```
+
+Read the centered column, not the raw one. PIQA starts at 50% and the other two at 25%, so
+raw accuracy overstates how much the model actually knows.
 
 ### Todo:
 

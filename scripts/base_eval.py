@@ -37,11 +37,12 @@ from nanomoe.loss_eval import evaluate_bpb
 # -----------------------------------------------------------------------------
 # CORE evaluation
 
+BENCHMARKS = ('arc_easy', 'piqa', 'hellaswag')
+
 EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
 
 
 def place_eval_bundle(file_path):
-    """Unzip eval_bundle.zip and place it in the base directory."""
     base_dir = get_base_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -53,10 +54,6 @@ def place_eval_bundle(file_path):
 
 
 def evaluate_core(model, tokenizer, device, max_per_task=-1):
-    """
-    Evaluate a base model on the CORE benchmark.
-    Returns dict with results, centered_results, and core_metric.
-    """
     base_dir = get_base_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
     # Download the eval bundle if needed
@@ -69,7 +66,9 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    tasks = config['icl_tasks']
+    # nanoMoE reports these three only. The bundle ships 22 tasks, but most of them sit on
+    # their chance floor at this scale and the mean over all of them hides that.
+    tasks = [t for t in config['icl_tasks'] if t['label'] in BENCHMARKS]
 
     # Load random baseline values
     random_baselines = {}
@@ -112,13 +111,12 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         elapsed = time.time() - start_time
         print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")
 
-    core_metric = sum(centered_results.values()) / len(centered_results)
-    out = {
+    mean_centered = sum(centered_results.values()) / len(centered_results)
+    return {
         "results": results,
         "centered_results": centered_results,
-        "core_metric": core_metric
+        "mean_centered": mean_centered,
     }
-    return out
 
 # -----------------------------------------------------------------------------
 # Main
@@ -194,9 +192,9 @@ def main():
                     acc = core_results["results"][label]
                     centered = core_results["centered_results"][label]
                     f.write(f"{label:<35}, {acc:<10.6f}, {centered:<10.6f}\n")
-                f.write(f"{'CORE':<35}, {'':<10}, {core_results['core_metric']:<10.6f}\n")
+                f.write(f"{'mean_centered':<35}, {'':<10}, {core_results['mean_centered']:<10.6f}\n")
             print0(f"\nResults written to: {output_csv_path}")
-            print0(f"CORE metric: {core_results['core_metric']:.4f}")
+            print0(f"mean centered (3 tasks): {core_results['mean_centered']:.4f}")
 
     compute_cleanup()
 

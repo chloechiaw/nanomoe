@@ -27,7 +27,6 @@ def build(config):
 
 
 def maxvio(counts):
-    """(max_load - mean_load) / mean_load, per row. 0 == perfectly balanced."""
     counts = counts.float()
     mean = counts.mean(dim=-1)
     return ((counts.max(dim=-1).values - mean) / mean)
@@ -95,9 +94,6 @@ def test_forward_shape_and_finiteness():
 
 
 def test_router_gradient_is_zero_at_init():
-    """Documents a real interaction with nanochat's init rather than a defect: every c_proj
-    starts at zero, so expert outputs are zero, so dL/dgate is zero and the router has no
-    gradient on step 0. QB is unaffected (it reads logits, not gradients)."""
     config = make_config()
     model = build(config)
     idx = torch.randint(0, config.vocab_size, (2, config.sequence_len))
@@ -107,8 +103,6 @@ def test_router_gradient_is_zero_at_init():
 
 
 def test_router_receives_gradient_once_experts_are_live():
-    """Selection is non-differentiable, but the sigmoid combine weights are the router's
-    gradient path. If this breaks, the router silently never learns for the whole run."""
     torch.manual_seed(0)
     config = make_config()
     model = build(config)
@@ -128,8 +122,6 @@ def test_router_receives_gradient_once_experts_are_live():
 
 
 def test_expert_with_zero_tokens_still_gets_a_gradient():
-    """Muon does torch.stack([p.grad for p in group]); a None grad from an unrouted expert
-    would crash the optimizer step. An empty matmul must still produce a zero grad."""
     config = make_config(n_expert=8, top_k=2)
     model = build(config)
     # Force every token to experts 0 and 1 by making their bias overwhelming
@@ -149,9 +141,6 @@ def test_expert_with_zero_tokens_still_gets_a_gradient():
 
 
 def test_grouped_dispatch_is_dropless_under_imbalance():
-    """Group sizes are the true per-expert counts, not a fixed capacity, so even a badly
-    skewed router must still route every token. A capacity-factor implementation would
-    silently drop here."""
     torch.manual_seed(0)
     cfg = make_config(n_expert=8, top_k=2, n_layer=1, n_embd=64)
     model = build(cfg)
@@ -169,7 +158,6 @@ def test_grouped_dispatch_is_dropless_under_imbalance():
 
 
 def test_dispatch_matches_a_reference_dense_computation():
-    """The gather/scatter loop must equal the obvious (slow) masked formulation."""
     torch.manual_seed(0)
     config = make_config(n_expert=6, top_k=2, n_embd=32)
     moe = MoEMLP(config)
@@ -218,8 +206,6 @@ def test_qb_bias_is_mean_centred_and_not_a_parameter():
 
 
 def test_qb_reduces_load_imbalance():
-    """The load-balancing claim itself. Start from a deliberately skewed router and check
-    that repeated QB updates drive MaxVio down without any tunable knob."""
     torch.manual_seed(0)
     config = make_config(n_expert=8, top_k=2, n_layer=1, n_embd=64)
     model = build(config)
@@ -253,8 +239,6 @@ def test_qb_reduces_load_imbalance():
 
 
 def test_qb_accumulates_across_micro_steps():
-    """Under gradient accumulation the betas must average over micro-batches, which is the
-    single-GPU stand-in for the reference's pmean across data-parallel shards."""
     config = make_config(n_expert=8, top_k=2, n_layer=1)
     model = build(config)
     moe = model.transformer.h[0].mlp

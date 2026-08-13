@@ -32,7 +32,6 @@ def _detect_compute_dtype():
 COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
 
 class ColoredFormatter(logging.Formatter):
-    """Custom formatter that adds colors to log messages."""
     # ANSI color codes
     COLORS = {
         'DEBUG': '\033[36m',    # Cyan
@@ -80,10 +79,6 @@ def get_base_dir():
     return nanochat_dir
 
 def download_file_with_lock(url, filename, postprocess_fn=None):
-    """
-    Downloads a file from a URL to a local path in the base directory.
-    Uses a lock file to prevent concurrent downloads among multiple ranks.
-    """
     base_dir = get_base_dir()
     file_path = os.path.join(base_dir, filename)
     lock_path = file_path + ".lock"
@@ -120,32 +115,10 @@ def print0(s="",**kwargs):
     if ddp_rank == 0:
         print(s, **kwargs)
 
-def print_banner():
-    # Cool DOS Rebel font ASCII banner made with https://manytools.org/hacker-tools/ascii-banner/
-    banner = """
-                                                       █████                █████
-                                                      ░░███                ░░███
-     ████████    ██████   ████████    ██████   ██████  ░███████    ██████  ███████
-    ░░███░░███  ░░░░░███ ░░███░░███  ███░░███ ███░░███ ░███░░███  ░░░░░███░░░███░
-     ░███ ░███   ███████  ░███ ░███ ░███ ░███░███ ░░░  ░███ ░███   ███████  ░███
-     ░███ ░███  ███░░███  ░███ ░███ ░███ ░███░███  ███ ░███ ░███  ███░░███  ░███ ███
-     ████ █████░░████████ ████ █████░░██████ ░░██████  ████ █████░░███████  ░░█████
-    ░░░░ ░░░░░  ░░░░░░░░ ░░░░ ░░░░░  ░░░░░░   ░░░░░░  ░░░░ ░░░░░  ░░░░░░░░   ░░░░░
-    """
-    print0(banner)
-
 def is_ddp_requested() -> bool:
-    """
-    True if launched by torchrun (env present), even before init.
-    Used to decide whether we *should* initialize a PG.
-    """
     return all(k in os.environ for k in ("RANK", "LOCAL_RANK", "WORLD_SIZE"))
 
 def is_ddp_initialized() -> bool:
-    """
-    True if torch.distributed is available and the process group is initialized.
-    Used at cleanup to avoid destroying a non-existent PG.
-    """
     return dist.is_available() and dist.is_initialized()
 
 def get_dist_info():
@@ -172,7 +145,6 @@ def autodetect_device_type():
     return device_type
 
 def compute_init(device_type="cuda"): # cuda|cpu|mps
-    """Basic initialization that we keep doing over and over, so make common."""
 
     assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
     if device_type == "cuda":
@@ -209,12 +181,10 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     return is_ddp_requested, ddp_rank, ddp_local_rank, ddp_world_size, device
 
 def compute_cleanup():
-    """Companion function to compute_init, to clean things up before script exit"""
     if is_ddp_initialized():
         dist.destroy_process_group()
 
 class DummyWandb:
-    """Useful if we wish to not use wandb but have all the same signatures"""
     def __init__(self):
         pass
     def log(self, *args, **kwargs):
@@ -229,51 +199,14 @@ def get_peak_flops(device_name: str) -> float:
     name = device_name.lower()
 
     # Table order matters: more specific patterns first.
+    # Only the cards nanoMoE is run on. Anything else returns inf below, so MFU shows 0%
+    # rather than a confidently wrong number.
     _PEAK_FLOPS_TABLE = (
-        # NVIDIA Blackwell
-        (["gb200"], 2.5e15),
-        (["grace blackwell"], 2.5e15),
-        (["b200"], 2.25e15),
-        (["b100"], 1.8e15),
-        # NVIDIA Hopper
-        (["h200", "nvl"], 836e12),
-        (["h200", "pcie"], 836e12),
         (["h200"], 989e12),
         (["h100", "nvl"], 835e12),
         (["h100", "pcie"], 756e12),
         (["h100"], 989e12),
-        (["h800", "nvl"], 989e12),
-        (["h800"], 756e12),
-        # NVIDIA Ampere data center
         (["a100"], 312e12),
-        (["a800"], 312e12),
-        (["a40"], 149.7e12),
-        (["a30"], 165e12),
-        # A10G before A10: "a10" is a substring of "NVIDIA A10G" and would match first.
-        # GA102 does 1024 bf16 FLOP/SM/clk dense, so: SMs * boost_clock * 1024.
-        #   A10G = 80 SM * 1.71 GHz, A10 = 72 SM * 1.695 GHz.
-        # NVIDIA's datasheets quote these inconsistently (the A10G sheet's 70/140 pair is
-        # dense/sparse, the A10 sheet's 125 is sparse-only), so they are computed here instead.
-        # Cross-check: an 8192^3 bf16 GEMM measures 7.94e13 on a Modal A10 = 63% of 1.25e14,
-        # a normal cuBLAS efficiency. Using the datasheet's 62.5e12 gave a nonsensical 127% MFU.
-        (["a10g"], 140e12),
-        (["a10"], 125e12),
-        # NVIDIA Ada data center
-        (["l40s"], 362e12),
-        (["l40-s"], 362e12),
-        (["l40 s"], 362e12),
-        (["l4"], 121e12),
-        # AMD CDNA accelerators
-        (["mi355"], 2.5e15),
-        (["mi325"], 1.3074e15),
-        (["mi300x"], 1.3074e15),
-        (["mi300a"], 980.6e12),
-        (["mi250x"], 383e12),
-        (["mi250"], 362.1e12),
-        # Consumer RTX
-        (["5090"], 209.5e12),
-        (["4090"], 165.2e12),
-        (["3090"], 71e12),
     )
     for patterns, flops in _PEAK_FLOPS_TABLE:
         if all(p in name for p in patterns):
@@ -285,55 +218,4 @@ def get_peak_flops(device_name: str) -> float:
 
     # Unknown GPU - return inf so MFU shows as 0% rather than a wrong guess
     logger.warning(f"Peak flops undefined for: {device_name}, MFU will show as 0%")
-    return float('inf')
-
-def get_peak_bandwidth(device_name: str) -> float:
-    """Peak HBM/GDDR memory bandwidth in bytes/sec. The decode phase of inference
-    is memory-bandwidth-bound, so this is the roofline for tokens/sec (see MBU)."""
-    name = device_name.lower()
-
-    # Table order matters: more specific patterns first.
-    _PEAK_BANDWIDTH_TABLE = (
-        # NVIDIA Blackwell (HBM3e)
-        (["gb200"], 8.0e12),
-        (["grace blackwell"], 8.0e12),
-        (["b200"], 8.0e12),
-        (["b100"], 8.0e12),
-        # NVIDIA Hopper
-        (["h200"], 4.8e12),
-        (["h100", "nvl"], 3.9e12),
-        (["h100", "pcie"], 2.0e12),
-        (["h100"], 3.35e12), # SXM
-        (["h800", "pcie"], 2.0e12),
-        (["h800"], 3.35e12), # SXM
-        # NVIDIA Ampere data center (A100 80GB; the 40GB variant is 1.6e12)
-        (["a100"], 2.0e12),
-        (["a800"], 2.0e12),
-        (["a40"], 696e9),
-        (["a30"], 933e9),
-        (["a10g"], 600e9),
-        (["a10"], 600e9),
-        # NVIDIA Ada data center
-        (["l40s"], 864e9),
-        (["l40-s"], 864e9),
-        (["l40 s"], 864e9),
-        (["l4"], 300e9),
-        # AMD CDNA accelerators
-        (["mi355"], 8.0e12),
-        (["mi325"], 6.0e12),
-        (["mi300x"], 5.3e12),
-        (["mi300a"], 5.3e12),
-        (["mi250x"], 3.28e12),
-        (["mi250"], 3.28e12),
-        # Consumer RTX
-        (["5090"], 1.79e12),
-        (["4090"], 1.01e12),
-        (["3090"], 936e9),
-    )
-    for patterns, bandwidth in _PEAK_BANDWIDTH_TABLE:
-        if all(p in name for p in patterns):
-            return bandwidth
-
-    # Unknown GPU - return inf so MBU shows as 0% rather than a wrong guess
-    logger.warning(f"Peak bandwidth undefined for: {device_name}, MBU will show as 0%")
     return float('inf')

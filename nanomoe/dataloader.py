@@ -23,13 +23,6 @@ from nanomoe.common import get_dist_info
 from nanomoe.dataset import list_parquet_files
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
-    """
-    Infinite iterator over document batches (list of text strings) from parquet files.
-
-    Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
-    where text_batch is a list of document strings, indices track position for resumption,
-    and epoch counts how many times we've cycled through the dataset (starts at 1).
-    """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
     warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
@@ -77,22 +70,6 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     device="cuda", resume_state_dict=None,
     buffer_size=1000
 ):
-    """
-    BOS-aligned dataloader with Best-Fit Cropping.
-
-    Reduces token waste compared to simple greedy cropping by searching a buffer
-    for documents that fit well, while maintaining 100% utilization (no padding).
-
-    Algorithm for each row:
-    1. From buffered docs, pick the LARGEST doc that fits entirely
-    2. Repeat until no doc fits
-    3. When nothing fits, crop a doc to fill remaining space exactly
-
-    Key properties:
-    - Every row starts with BOS
-    - 100% utilization (no padding, every token is trained on)
-    - Approximately 35% of all tokens are discarded due to cropping
-    """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
 
     row_capacity = T + 1
@@ -161,6 +138,5 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
-    """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets

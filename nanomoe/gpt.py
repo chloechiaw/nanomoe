@@ -50,15 +50,11 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
 class Linear(nn.Linear):
-    """nn.Linear that casts weights to match input dtype in forward.
-    Replaces autocast: master weights stay fp32 for optimizer precision,
-    but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
 def has_ve(layer_idx, n_layer):
-    """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
 def apply_rotary_emb(x, cos, sin):
@@ -254,11 +250,6 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
-        """
-        NOTE a major footgun: this __init__ function runs in meta device context (!!)
-        Therefore, any calculations inside here are shapes and dtypes only, no actual data.
-        => We actually initialize all data (parameters, buffers, etc.) in init_weights() instead.
-        """
         super().__init__()
         self.config = config
         # Compute per-layer window sizes for sliding window attention
@@ -301,19 +292,6 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        """
-        Initialize the full model in this one function for maximum clarity.
-
-        wte (embedding):     normal, std=1.0
-        lm_head:             normal, std=0.001
-        for each block:
-            attn.c_q:        uniform, std=1/sqrt(n_embd)
-            attn.c_k:        uniform, std=1/sqrt(n_embd)
-            attn.c_v:        uniform, std=1/sqrt(n_embd)
-            attn.c_proj:     zeros
-            mlp.c_fc:        uniform, std=1/sqrt(n_embd)
-            mlp.c_proj:      zeros
-        """
 
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
@@ -398,16 +376,6 @@ class GPT(nn.Module):
         return cos, sin
 
     def _compute_window_sizes(self, config):
-        """
-        Compute per-layer window sizes for sliding window attention.
-
-        Returns list of (left, right) tuples for FA3's window_size parameter:
-        - left: how many tokens before current position to attend to (-1 = unlimited)
-        - right: how many tokens after current position to attend to (0 for causal)
-
-        Pattern string is tiled across layers. Final layer always gets L (full context).
-        Characters: L=long (full context), S=short (quarter context)
-        """
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
         # Map characters to window sizes
@@ -430,17 +398,6 @@ class GPT(nn.Module):
         return self.transformer.wte.weight.device
 
     def estimate_flops(self):
-        """
-        Return the estimated FLOPs per token for the model (forward + backward).
-        Each matmul weight parameter contributes 2 FLOPs (multiply *, accumulate +) in forward, and 2X that in backward => 2+4=6.
-        Cleanest explanation of this: https://medium.com/@dzmitrybahdanau/the-flops-calculus-of-language-model-training-3b19c1f025e4
-        On top of that, 12 * h * q * effective_seq_len accounts for key @ query matmul flops inside attention.
-        With sliding windows, effective_seq_len varies per layer (capped by window size).
-        Ref: https://arxiv.org/abs/2204.02311 (PaLM paper).
-        This is ~1% off from the exact formulas of Chinchilla paper, the difference is:
-        - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
-        - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
-        """
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -452,22 +409,10 @@ class GPT(nn.Module):
         return num_flops_per_token
 
     def num_matmul_params(self):
-        """
-        The number of parameters that participate in matmuls with the token stream,
-        i.e. contribute 2 FLOPs/param to the forward pass. Counted structurally: every
-        matmul in this model goes through the Linear class, while non-matmul params
-        (embeddings = lookups, per-layer scalars) are nn.Embedding or raw Parameters.
-        """
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
         return matmul_params
 
     def num_active_matmul_params(self):
-        """
-        The matmul params a single token actually flows through. Identical to
-        num_matmul_params() for a dense model; for MoE only top_k of n_expert experts run per
-        token, so the inactive ones must come off the total or every FLOP-derived number (MFU,
-        training FLOPs, the frontier plot's x-axis) is inflated by n_expert/top_k.
-        """
         active = self.num_matmul_params()
         for block in self.transformer.h:
             if isinstance(block.mlp, MoEMLP):
@@ -479,16 +424,12 @@ class GPT(nn.Module):
         return any(isinstance(block.mlp, MoEMLP) for block in self.transformer.h)
 
     def apply_qb_update(self):
-        """Fold each MoE layer's accumulated QB betas into its router bias. Call once per
-        optimizer step, after backward. No-op on a dense model."""
         for block in self.transformer.h:
             if isinstance(block.mlp, MoEMLP):
                 block.mlp.apply_qb_update()
 
     @torch.no_grad()
     def expert_load(self, reset=True):
-        """Per-expert token counts since the last call, as a (n_moe_layer, n_expert) tensor.
-        This is what the 'expert load over training' plot is drawn from."""
         counts = []
         for block in self.transformer.h:
             if isinstance(block.mlp, MoEMLP):
@@ -498,10 +439,6 @@ class GPT(nn.Module):
         return torch.stack(counts) if counts else None
 
     def estimate_decode_flops(self, context_len):
-        """
-        Forward FLOPs to decode one token at a given context length during inference:
-        2 FLOPs per matmul param, plus attention over min(context, window) per layer.
-        """
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in self.window_sizes)
@@ -509,7 +446,6 @@ class GPT(nn.Module):
         return decode_flops
 
     def estimate_prefill_flops(self, num_tokens):
-        """Forward FLOPs to prefill a prompt: causal, so token t attends to min(t, window)."""
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         attn_flops = 0
@@ -521,14 +457,11 @@ class GPT(nn.Module):
         return prefill_flops
 
     def kv_bytes_per_token(self):
-        """Bytes to *store* one token of KV cache during inference, per row (all layers)."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize # the KV cache is kept in the compute dtype
         return self.config.n_layer * 2 * self.config.n_kv_head * head_dim * kv_dtype_bytes
 
     def kv_read_bytes(self, context_len):
-        """Bytes of KV cache *read* by one decode step at a given context length, per row.
-        Sliding window layers only attend to (and read) the last `window` tokens."""
         head_dim = self.config.n_embd // self.config.n_head
         kv_dtype_bytes = COMPUTE_DTYPE.itemsize
         total = 0
@@ -537,17 +470,6 @@ class GPT(nn.Module):
         return total
 
     def num_scaling_params(self):
-        """
-        Return detailed parameter counts for scaling law analysis.
-        Different papers use different conventions:
-        - Kaplan et al. excluded embedding parameters
-        - Chinchilla included all parameters
-        Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper)
-        Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper)
-
-        Returns a dict with counts for each parameter group, so downstream analysis
-        can experiment with which combination gives the cleanest scaling laws.
-        """
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
@@ -674,12 +596,6 @@ class GPT(nn.Module):
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
-        """
-        Naive autoregressive streaming inference.
-        To make it super simple, let's assume:
-        - batch size is 1
-        - ids and the yielded tokens are simple Python lists and ints
-        """
         assert isinstance(tokens, list)
         device = self.get_device()
         rng = None
