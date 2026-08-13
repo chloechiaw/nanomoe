@@ -1,17 +1,22 @@
 # nanoMoE
 
-A minimal Mixture-of-Experts language model for fast experimentation! 
+A toy Mixture-of-Experts language model for fast experimentation! 
 
-## Reproducing the 5 hour run
+## Training 
+Using this repo, you can train a reasonable performing Mixture of Experts model for <$20 on an H100. 
+* 4.12e18 FLOPs
+* 3.85B tokens in 5.1 hours on a single H100, much less compute than the smallest MoEs out there (480x less than Pythia-1B and 9,500x less than OLMoE-1B-7B). 
 
-One H100. About 5 hours of training and $21 on Modal. Params are 498M total and 184M active.
+<img width="1289" height="462" alt="png" src="https://github.com/user-attachments/assets/ce1adbb7-da66-4860-8d6f-f65eb04b5549" />
+
+I referred to the [OLMoE paper](https://arxiv.org/abs/2409.02060) where they have a table of varying MoE sizes and their performance on 8 benchmarks. The smallest band is 1B active parameters (compare this with nanochat's 561M params), which means a routing experiment costs cluster time and days.The architecture follows a typical MoE, the only new thing I added was * [quantile balancing (from Jianlin Su, used in Kimi K3]. This is great because we don't need to do hyperparameter sweeps and also deals with load balancing. 
 
 ### Setup
 
 ```bash
 pip install modal && modal setup
 export NANOMOE_GPU=H100
-export WANDB_API_KEY=...        # optional, for live curves
+export WANDB_API_KEY=...       
 ```
 
 ### Data
@@ -62,3 +67,7 @@ modal run --detach modal_app.py::mmlu --args "--model-tag=moe-d16-h100"
 ```bash
 modal volume get nano-moe-data nanochat/base_eval/base_model_007350.csv .
 ```
+
+### Todo:
+
+More ablations 
