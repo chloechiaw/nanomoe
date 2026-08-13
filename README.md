@@ -3,8 +3,7 @@
 A toy Mixture-of-Experts for fast experimentation. We utilize nanochat but with an MoE block that replaces the transformer block's dense MLP. 
 
 ## Training 
-You can train a reasonably performing Mixture of Experts model for <$20 on 1x H100 using 3-4 less OOMs less compute than the smallest open source MoEs. 
-* 480x below Pythia-1B (10^2.7) and 9,500x below OLMoE-1B-7B (10^4.0)
+You can train a reasonably performing Mixture of Experts model for <$20 on 1x H100 using 3-4 less OOMs less compute than the smallest open source MoEs (480x below Pythia-1B (10^2.7 FLOPs) and 9,500x below OLMoE-1B-7B (10^4.0 FLOPs))
 
 <img width="1289" height="462" alt="png" src="https://github.com/user-attachments/assets/ce1adbb7-da66-4860-8d6f-f65eb04b5549" />
 
