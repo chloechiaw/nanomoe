@@ -35,7 +35,7 @@ this reproduces the run:
 modal run --detach modal_app.py::train --run nanomoe-h100 --args "--model-tag=moe-d16-h100"
 ```
 
-Spelled out, in case you want to change something:
+Alternatively: 
 
 ```bash
 modal run --detach modal_app.py::train --run nanomoe-h100 --args \
@@ -50,21 +50,9 @@ modal run --detach modal_app.py::train --run nanomoe-h100 --args \
 
 ### Evaluate
 
-Scores ARC-Easy, PIQA and HellaSwag on the full test sets, plus train/val bits-per-byte.
-Point it at any checkpoint with `--model-tag`:
-
 ```bash
 TAG=moe-d16-h100
 modal run --detach modal_app.py::evaluate --args "--model-tag=$TAG --device-batch-size=8"
-```
-
-Useful variations:
-
-```bash
---eval core                  # benchmarks only, skip bpb
---eval bpb                   # bpb only, ~1 min
---max-per-task=200           # sample instead of the full test set, for a quick read
---step=2500                  # an earlier checkpoint (default: the newest)
 ```
 
 Results land on the volume as `base_eval/base_model_<step>.csv`, one row per benchmark with
