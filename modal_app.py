@@ -31,7 +31,7 @@ import modal
 APP_NAME = "nano-moe"
 # 24GB, GA102/sm_86, no FP8. Note: this tier has been observed to schedule a plain A10
 # (72 SM, 125 TFLOPS dense bf16) rather than an A10G (80 SM, 140). `probe` reports which.
-GPU_TYPE = "A10G"
+GPU_TYPE = os.environ.get("NANOMOE_GPU", "A10G")
 REPO_ROOT = Path(__file__).parent
 REMOTE_REPO = "/root/nano-moe"
 VOLUME_NAME = "nano-moe-data"
