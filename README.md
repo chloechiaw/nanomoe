@@ -7,7 +7,7 @@ You can train a reasonably performing Mixture of Experts model for <$20 on 1x H1
 
 <img width="2600" height="940" alt="nanomoe_frontier" src="https://github.com/user-attachments/assets/34400ee1-1052-41c6-997c-888b22c1fee6" />
 
-I referred to [OLMoE](https://arxiv.org/abs/2409.02060) where they have a table of varying MoE sizes and their performance on 8 benchmarks. The smallest category of MoEs they use is 1B active parameters (compare this with nanochat's 561M params), which means a routing experiment costs time $$ and multiple GPUs. The architecture follows a typical MoE, the only new thing I added was quantile balancing (from Jianlin Su, used in Kimi K3). This is great because we don't need to do [hyperparameter sweeps](https://openathena.ai/blog/quantile-balancing/) and also deals with load balancing.
+The smallest category of MoEs today use is 1B active parameters (compare this with nanochat's 561M params), which means a routing experiment costs time $$ and multiple GPUs. The architecture follows a typical MoE, the only new thing I added was quantile balancing (from Jianlin Su, used in Kimi K3). This is great because we don't need to do [hyperparameter sweeps](https://openathena.ai/blog/quantile-balancing/) and also deals with load balancing.
 
 ### Setup
 
@@ -79,4 +79,25 @@ for c in "${configs[@]}"; do
        --target-flops=5e17 --model-tag=gran-e$e-k$k"
 done
 ```
+
+### Pythia and OLMo comparisons
+
+nanoMoE reaches 97% of Pythia-1B's average across these six benchmarks and 87% of OLMo-1B's,
+with 6-7x fewer active parameters.
+
+| benchmark | chance | nanoMoE | Pythia-1B | % of | OLMo-1B | % of |
+|---|---|---|---|---|---|---|
+| MMLU | 25 | 26.0 | 31.1 | 84% | 32.1 | 81% |
+| HellaSwag | 25 | 43.8 | 48.0 | 91% | 67.5 | 65% |
+| ARC-Challenge | 25 | 33.2 | 31.4 | **106%** | 36.4 | 91% |
+| ARC-Easy | 25 | 57.7 | 63.4 | 91% | 53.5 | **108%** |
+| PIQA | 50 | 70.2 | 68.9 | **102%** | 74.0 | 95% |
+| WinoGrande | 50 | 54.4 | 52.7 | **103%** | 62.9 | 86% |
+| **average** | | **47.5** | **49.3** | **97%** | **54.4** | **87%** |
+
+| | active params | total params |
+|---|---|---|
+| nanoMoE | 0.18B | 0.50B |
+| Pythia-1B | 1.1B (dense) | 1.1B |
+| OLMo-1B | 1.3B (dense) | 1.3B |
 
