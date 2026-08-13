@@ -1,6 +1,6 @@
 # nanoMoE
 
-A toy Mixture-of-Experts language model for fast experimentation. We utilize nanochat but with an MoE block that replaces the transformer block's dense MLP. 
+A toy Mixture-of-Experts for fast experimentation. We utilize nanochat but with an MoE block that replaces the transformer block's dense MLP. 
 
 ## Training 
 You can train a reasonable performing Mixture of Experts model for <$20 on 1x H100 using 3-4 less OOMs. 
