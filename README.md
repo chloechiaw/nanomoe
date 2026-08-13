@@ -1,49 +1,64 @@
 # nanoMoE
 
-> nanoMoE: a minimal Mixture-of-Experts language model 
+A minimal Mixture-of-Experts language model for fast experimentation! 
 
+## Reproducing the 5 hour run
 
-Trained in 5–7 hours on a single A10G (24 GiB) via Modal. At d_model=256 / 8 layers / 8 experts top-2, only 33% of params are active per token (12.6M of 37.8M, ex-embeddings), and it reaches 1B tokens in ~2.2h — well inside budget. 
+One H100. About 5 hours of training and $21 on Modal. Params are 498M total and 184M active.
 
- `scripts/size_moe.py --sweep` finds configs in the target band, 
- `scripts/bench_step.py` gives you the GPU-side step-time ceiling before you commit to a run, and `--n-expert=1` falls straight back to the dense MLP (upstream's 48 tests still pass unmodified).
-
-### Quantile Balancing (QB)
-
-Instead of an aux load-balancing loss with a coefficient to tune, QB adds a per-expert `router_bias` recomputed in closed form every step. Setting each `-bias[e]` to the fair-share quantile of that expert's logits hands it exactly its share of tokens *by construction*, rather than nudging toward it. **Nothing to tune** — no balance coefficient, no update rate. Balance is reported as `MaxVio = (max_load - mean_load) / mean_load`; 0 is perfect. Ported from [Marin](https://github.com/marin-community/marin)'s JAX implementation, idea from Jianlin Su.
-
-### Usage
-
-A10G Modal instance.
+### Setup
 
 ```bash
-pip install modal && modal setup                    # once
-
-modal run modal_app.py::probe                        # ~2 min,  is the GPU stack sane?
-modal run modal_app.py::prepare --shards 32          # ~30 min, data + tokenizer + eval
-modal run modal_app.py::smoke                        # ~10 min, 30 real steps -> tok/sec
+pip install modal && modal setup
+export NANOMOE_GPU=H100
+export WANDB_API_KEY=...        # optional, for live curves
 ```
 
-Train (`--args` is forwarded verbatim to `base_train.py` and overrides the A10G defaults):
+### Data
 
 ```bash
-modal run modal_app.py::train --args "--depth=8"
-modal run modal_app.py::train --args "--depth=10 --device-batch-size=4 --num-iterations=8000"
+modal run modal_app.py::prepare --shards 120 --vocab-size 8192
 ```
 
-Runs resume from the last checkpoint automatically:
+Downloads 120 ClimbMix shards, trains an 8192 token BPE tokenizer.
+
+### Check the GPU before committing
 
 ```bash
-modal run modal_app.py::train --args "--resume-from-step=4000"
+modal run modal_app.py::smoke        # 30 real steps, prints tokens/sec
 ```
 
-Eval:
+### Train
 
 ```bash
-modal run modal_app.py::evaluate --args "--model-tag=d8"
+modal run --detach modal_app.py::train --run nanomoe-h100 --args \
+  "--depth=16 --aspect-ratio=40 --head-dim=64 --window-pattern=L \
+   --n-expert=8 --top-k=2 --moe-dispatch=grouped \
+   --device-batch-size=32 --num-iterations=7350 \
+   --model-tag=moe-d16-h100 \
+   --eval-every=500 --eval-tokens=10485760 \
+   --core-metric-every=1500 --core-metric-max-per-task=200 \
+   --sample-every=-1 --expert-load-every=200 --save-every=2500"
 ```
 
+### Resume checkpointing 
+Resume from the newest checkpoint after an interruption, passing the same architecture
+flags:
 
-- **bf16, no fp8, no FA3** on sm_86 — confirmed, not assumed. Don't "optimise" `--window-pattern=L` back.
-- The router's gradient is exactly zero on step 0 (c_proj is zero-init); it starts learning one step later. QB is unaffected since it reads logits, not gradients. `tests/test_moe.py` pins this.
-- Batch/LR/weight-decay scaling laws are inherited from dense nanochat and *not* re-derived for MoE — the training script warns you.
+```bash
+modal run --detach modal_app.py::train --run nanomoe-h100 --resume --args "<same flags>"
+```
+
+### Evaluate
+
+```bash
+modal run --detach modal_app.py::evaluate --args "--model-tag=moe-d16-h100 --device-batch-size=8"
+modal run --detach modal_app.py::mmlu --args "--model-tag=moe-d16-h100"
+```
+
+`evaluate` writes per task accuracy to
+`nanochat/base_eval/base_model_007350.csv` on the volume. Pull it down with:
+
+```bash
+modal volume get nano-moe-data nanochat/base_eval/base_model_007350.csv .
+```
