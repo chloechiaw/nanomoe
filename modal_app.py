@@ -1,5 +1,5 @@
 """
-Modal harness for nanoMoE: single-GPU (A10G) training of the nanochat-derived MoE model.
+Modal harness for nanoMoE: single-GPU (H100) training of the nanochat-derived MoE model.
 
 Everything stateful (dataset shards, tokenizer, eval bundle, checkpoints, HF kernel cache)
 lives on a single Modal Volume mounted at /data, so runs are resumable and the expensive
@@ -7,9 +7,7 @@ prepare steps happen exactly once.
 
 Typical first-time flow:
 
-    modal run modal_app.py::probe                      # ~1 min : is the GPU stack sane?
     modal run modal_app.py::prepare --shards 32        # ~20 min: data + tokenizer + eval bundle
-    modal run modal_app.py::smoke                      # ~10 min: 30 real training steps, get tok/sec
     modal run modal_app.py::train --args "--depth=8"   # the real run
 
 See README.md for the annotated version of the above.
@@ -29,9 +27,9 @@ import modal
 # Constants
 
 APP_NAME = "nano-moe"
-# 24GB, GA102/sm_86, no FP8. Note: this tier has been observed to schedule a plain A10
-# (72 SM, 125 TFLOPS dense bf16) rather than an A10G (80 SM, 140). `probe` reports which.
-GPU_TYPE = os.environ.get("NANOMOE_GPU", "A10G")
+# 80GB, sm_90. torch._grouped_mm needs a Hopper-class card, so this is the supported target.
+# Override with NANOMOE_GPU if you have something else.
+GPU_TYPE = os.environ.get("NANOMOE_GPU", "H100")
 REPO_ROOT = Path(__file__).parent
 REMOTE_REPO = "/root/nano-moe"
 VOLUME_NAME = "nano-moe-data"
@@ -149,77 +147,11 @@ def _merge_args(defaults: list[str], overrides: str) -> list[str]:
 # Diagnostics
 
 
-@app.function(gpu=GPU_TYPE, volumes=VOLUMES, timeout=30 * 60)
-def probe():
-    """Report what the GPU stack actually resolved to. Needs no data — run this first."""
-    import torch
-
-    sys.path.insert(0, REMOTE_REPO)
-    os.chdir(REMOTE_REPO)
-
-    name = torch.cuda.get_device_name(0)
-    cap = torch.cuda.get_device_capability()
-    total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-
-    from nanochat.common import COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, get_peak_flops
-    from nanochat.flash_attention import HAS_FA3, USE_FA3
-
-    peak = get_peak_flops(name)
-
-    print("=" * 70)
-    print(f"GPU              : {name}  (sm_{cap[0]}{cap[1]}, {total_gb:.1f} GiB)")
-    print(f"torch            : {torch.__version__}  cuda {torch.version.cuda}")
-    print(f"compute dtype    : {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
-    print(f"peak bf16 FLOPS  : {peak:.3e}")
-    print(f"FA3 available    : {HAS_FA3}")
-    print(f"FA3 in use       : {USE_FA3}")
-    print("=" * 70)
-
-    if not USE_FA3:
-        print(
-            "NOTE: falling back to PyTorch SDPA. SDPA has no fused sliding-window support, so\n"
-            "      pass --window-pattern=L (full context on every layer) or utilization will\n"
-            "      be poor. With FA3 active, the default SSSL pattern is the faster choice."
-        )
-
-    # measured bf16 matmul throughput, as a reality check on the datasheet number
-    a = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
-    for _ in range(3):
-        a @ b
-    torch.cuda.synchronize()
-    t0 = time.time()
-    iters = 30
-    for _ in range(iters):
-        a @ b
-    torch.cuda.synchronize()
-    measured = iters * 2 * 8192**3 / (time.time() - t0)
-    print(f"measured 8k bf16 matmul: {measured:.3e} FLOP/s ({100 * measured / peak:.1f}% of peak)")
-
-    return {"gpu": name, "sm": f"{cap[0]}{cap[1]}", "fa3": USE_FA3, "peak_flops": peak}
-
-
-# -----------------------------------------------------------------------------
-# Data preparation (CPU only)
-
-
 @app.function(cpu=4.0, memory=8192, timeout=30 * 60)
 def test(args: str = ""):
     """Run the MoE / Quantile Balancing test suite. CPU only, so effectively free — run this
-    before spending GPU time on a bench or a training run."""
+    before spending GPU time on a training run."""
     _run("-m", "pytest", *(shlex.split(args) or ["tests/test_moe.py", "-v"]))
-
-
-@app.function(gpu=GPU_TYPE, volumes=VOLUMES, timeout=1 * HOURS)
-def bench(args: str = ""):
-    """Warm up, then time training steps on random tokens and project against the budget.
-    Needs no dataset, so it runs standalone.
-
-        modal run modal_app.py::bench --args "--n-expert 8 --top-k 2"
-        modal run modal_app.py::bench --args "--n-expert 1"     # dense, for the MoE/dense ratio
-    """
-    argv = _merge_args(BENCH_DEFAULTS, args)
-    _run("-m", "scripts.bench_step", *argv)
 
 
 @app.function(cpu=8.0, memory=16384, volumes=VOLUMES, timeout=4 * HOURS)
@@ -230,7 +162,7 @@ def download_data(shards: int = 32, workers: int = 16):
     best-fit dataloader discards ~35% of tokens to cropping, so budget ~1.5x. 32 shards is
     ~2B usable tokens, comfortably above the 500M–1B target with no epoch repeats.
     """
-    _run("-m", "nanochat.dataset", "-n", str(shards), "-w", str(workers))
+    _run("-m", "nanomoe.dataset", "-n", str(shards), "-w", str(workers))
     data_vol.commit()
 
 
@@ -242,7 +174,6 @@ def train_tokenizer(vocab_size: int = 32768, max_chars: int = 2_000_000_000):
     params in wte+lm_head than in the MoE trunk. --vocab-size 8192 is the alternative.
     """
     _run("-m", "scripts.tok_train", f"--vocab-size={vocab_size}", f"--max-chars={max_chars}")
-    _run("-m", "scripts.tok_eval")
     data_vol.commit()
 
 
@@ -251,7 +182,7 @@ def download_eval_bundle():
     """Prefetch the CORE eval bundle so the first in-training CORE eval doesn't stall."""
     sys.path.insert(0, REMOTE_REPO)
     os.chdir(REMOTE_REPO)
-    from nanochat.common import download_file_with_lock
+    from nanomoe.common import download_file_with_lock
     from scripts.base_eval import EVAL_BUNDLE_URL, place_eval_bundle
 
     download_file_with_lock(EVAL_BUNDLE_URL, "eval_bundle.zip", postprocess_fn=place_eval_bundle)
@@ -261,53 +192,31 @@ def download_eval_bundle():
 # -----------------------------------------------------------------------------
 # Training
 #
-# A10G defaults, and why:
-#   --device-batch-size=8    24 GB is the binding constraint, and the logit tensor dominates:
-#                            base_train materialises B*T*vocab in bf16, again in fp32, again
-#                            after the tanh softcap, and again inside cross_entropy. At B=8,
-#                            T=2048, vocab=32768 that chain alone is ~7.5 GiB. Drop to 4 if you
-#                            OOM; a smaller --vocab-size at tokenizer time helps a lot here.
-#                            MoE will add pressure too: 8x the FFN weights and 8x their
-#                            optimizer state stay resident even though only top-2 are active.
-#   --window-pattern=L       safe under the SDPA fallback. If `probe` reports FA3 in use, SSSL
-#                            is faster — pass it explicitly.
-#   (no --fp8)               sm_86 has no FP8 tensor cores.
-#   --total-batch-size       left on auto (-1); with world_size=1 it is reached purely by
-#                            gradient accumulation.
-
-# --depth/--aspect-ratio/--head-dim give d_model = 8 * 32 = 256, n_head = 4: the config
-# scripts/size_moe.py picks out as hitting the brief's ~40M total / ~15M active target.
-# Leaving aspect-ratio at nanochat's default 64 would build d_model=512, a 243M-param model.
-# --device-batch-size=8 is the value that is safe at either vocab size; at --vocab-size=8192
-# raise it to 32 for ~25% more throughput (17.1 of 22.1 GiB, measured — see README).
+# H100 defaults: these are exactly the flags that trained moe-d16-h100 (val_bpb 0.7822,
+# CORE 0.1901) in 5.1 hours, so a bare `modal run ::train` reproduces that run.
+#
+#   --depth=16 --aspect-ratio=40   d_model 640, the compute-optimal size for a 5 hour budget
+#   --device-batch-size=32         73.8 of 79.2 GiB; 40 and above OOM
+#   --window-pattern=L             full context; no FA3 build is published for this stack
+#   --num-iterations=7350          3.85B tokens at total-batch 524,288
+#
 TRAIN_DEFAULTS = [
-    "--depth=8",
-    "--aspect-ratio=32",
+    "--depth=16",
+    "--aspect-ratio=40",
     "--head-dim=64",
-    "--device-batch-size=8",
     "--window-pattern=L",
     "--n-expert=8",
     "--top-k=2",
-    "--eval-every=250",
-    "--core-metric-every=2000",
-    "--sample-every=2000",
-    "--save-every=1000",
-    "--expert-load-every=100",
+    "--device-batch-size=32",
+    "--num-iterations=7350",
+    "--eval-every=500",
+    "--eval-tokens=10485760",
+    "--core-metric-every=1500",
+    "--core-metric-max-per-task=200",
+    "--expert-load-every=200",
+    "--save-every=2500",
 ]
 
-# bench_step.py takes the same architecture flags but drives them with random tokens
-BENCH_DEFAULTS = [
-    "--depth=8",
-    "--aspect-ratio=32",
-    "--head-dim=64",
-    "--device-batch-size=8",
-    "--window-pattern=L",
-    "--n-expert=8",
-    "--top-k=2",
-    "--grad-accum=4",
-    "--warmup=6",
-    "--steps=20",
-]
 
 
 @app.function(
@@ -325,31 +234,6 @@ def train(args: str = "", run: str = "dummy"):
     argv = _merge_args(TRAIN_DEFAULTS, args) + [f"--run={run}"]
     with _PeriodicCommit():
         _run("-m", "scripts.base_train", *argv)
-
-
-@app.function(gpu=GPU_TYPE, volumes=VOLUMES, timeout=1 * HOURS)
-def smoke(args: str = ""):
-    """A short but *real* training run: validates the full stack and, more importantly,
-    measures tok/sec so you can size the token budget for a 5-7 hour run."""
-    argv = _merge_args(
-        [
-            "--depth=8",
-            "--device-batch-size=8",
-            "--window-pattern=L",
-            "--num-iterations=30",
-            "--total-batch-size=32768",
-            "--eval-every=-1",
-            "--core-metric-every=-1",
-            "--sample-every=-1",
-            "--model-tag=smoke",
-        ],
-        args,
-    )
-    _run("-m", "scripts.base_train", *argv)
-    print(
-        "\nRead `tok/sec` off the last few steps above (ignore the first ~10, they include\n"
-        "torch.compile warmup), then: tokens_in_6h = tok_per_sec * 21600."
-    )
 
 
 @app.function(gpu=GPU_TYPE, volumes=VOLUMES, timeout=4 * HOURS)
@@ -395,4 +279,4 @@ def prepare(shards: int = 32, vocab_size: int = 32768, max_chars: int = 2_000_00
     train_tokenizer.remote(vocab_size=vocab_size, max_chars=max_chars)
     print("[3/3] fetching CORE eval bundle ...")
     download_eval_bundle.remote()
-    print("done. next: modal run modal_app.py::smoke")
+    print("done. next: modal run --detach modal_app.py::train")

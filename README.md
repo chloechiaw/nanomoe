@@ -1,15 +1,17 @@
 # nanoMoE
 
-A toy Mixture-of-Experts language model for fast experimentation! 
+A toy Mixture-of-Experts language model for fast experimentation. We utilize nanochat but with an MoE block that replaces the transformer block's dense MLP. 
 
 ## Training 
-Using this repo, you can train a reasonable performing Mixture of Experts model for <$20 on an H100. 
+You can train a reasonable performing Mixture of Experts model for <$20 on 1x H100 using 3-4 less OOMs. 
 * 4.12e18 FLOPs
-* 3.85B tokens in 5.1 hours on a single H100, much less compute than the smallest MoEs out there (480x less than Pythia-1B and 9,500x less than OLMoE-1B-7B). 
+* 3.85B tokens in 5.1 hours
+
+480x below Pythia-1B (10^2.7) and 9,500x below OLMoE-1B-7B (10^4.0)
 
 <img width="1289" height="462" alt="png" src="https://github.com/user-attachments/assets/ce1adbb7-da66-4860-8d6f-f65eb04b5549" />
 
-I referred to the [OLMoE paper](https://arxiv.org/abs/2409.02060) where they have a table of varying MoE sizes and their performance on 8 benchmarks. The smallest band is 1B active parameters (compare this with nanochat's 561M params), which means a routing experiment costs cluster time and days.The architecture follows a typical MoE, the only new thing I added was * [quantile balancing (from Jianlin Su, used in Kimi K3]. This is great because we don't need to do hyperparameter sweeps and also deals with load balancing. 
+I referred to the [OLMoE paper](https://arxiv.org/abs/2409.02060) where they have a table of varying MoE sizes and their performance on 8 benchmarks. The smallest category of MoEs they use is 1B active parameters (compare this with nanochat's 561M params), which means a routing experiment costs cluster time and days.The architecture follows a typical MoE, the only new thing I added was quantile balancing (from Jianlin Su, used in Kimi K3). This is great because we don't need to do (hyperparameter sweeps)[https://openathena.ai/blog/quantile-balancing/] and also deals with load balancing. 
 
 ### Setup
 
@@ -27,23 +29,26 @@ modal run modal_app.py::prepare --shards 120 --vocab-size 8192
 
 Downloads 120 ClimbMix shards, trains an 8192 token BPE tokenizer.
 
-### Check the GPU before committing
+### Train
+
+`TRAIN_DEFAULTS` in `modal_app.py` is exactly the config that produced the numbers above, so
+this reproduces the run:
 
 ```bash
-modal run modal_app.py::smoke        # 30 real steps, prints tokens/sec
+modal run --detach modal_app.py::train --run nanomoe-h100 --args "--model-tag=moe-d16-h100"
 ```
 
-### Train
+Spelled out, in case you want to change something:
 
 ```bash
 modal run --detach modal_app.py::train --run nanomoe-h100 --args \
   "--depth=16 --aspect-ratio=40 --head-dim=64 --window-pattern=L \
-   --n-expert=8 --top-k=2 --moe-dispatch=grouped \
+   --n-expert=8 --top-k=2 \
    --device-batch-size=32 --num-iterations=7350 \
    --model-tag=moe-d16-h100 \
    --eval-every=500 --eval-tokens=10485760 \
    --core-metric-every=1500 --core-metric-max-per-task=200 \
-   --sample-every=-1 --expert-load-every=200 --save-every=2500"
+   --expert-load-every=200 --save-every=2500"
 ```
 
 ### Resume checkpointing 
@@ -58,7 +63,6 @@ modal run --detach modal_app.py::train --run nanomoe-h100 --resume --args "<same
 
 ```bash
 modal run --detach modal_app.py::evaluate --args "--model-tag=moe-d16-h100 --device-batch-size=8"
-modal run --detach modal_app.py::mmlu --args "--model-tag=moe-d16-h100"
 ```
 
 `evaluate` writes per task accuracy to

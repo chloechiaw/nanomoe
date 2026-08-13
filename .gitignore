@@ -15,3 +15,7 @@ wandb/
 # Modal
 .modal.toml
 checkpoints/
+
+# generated figures and upstream nanochat notes
+assets/
+dev/

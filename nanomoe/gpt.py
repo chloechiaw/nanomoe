@@ -21,11 +21,11 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW
+from nanomoe.common import get_dist_info, print0, COMPUTE_DTYPE
+from nanomoe.optim import MuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
-from nanochat.flash_attention import flash_attn
+from nanomoe.flash_attention import flash_attn
 
 @dataclass
 class GPTConfig:
@@ -39,20 +39,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # Mixture of Experts. n_expert=1 is the dense MLP, i.e. upstream nanochat unchanged.
-    # n_expert>1 replaces every MLP with a routed MoE of n_expert copies, top_k active per token.
+    # Mixture of Experts. n_expert=1 leaves the dense MLP alone, so upstream nanochat is still
+    # reachable and works as the baseline. Above 1, every MLP becomes n_expert copies with
+    # top_k of them running per token.
     n_expert: int = 1
     top_k: int = 1
-    # How the routed experts are executed. Both produce identical outputs (tests/test_moe.py
-    # asserts this); they differ only in how many kernels they launch.
-    #   "loop"    - a Python for-loop over experts: gather -> small matmul -> scatter, E times
-    #               per layer. Simple, obviously correct, but launch-bound.
-    #   "batched" - sort tokens by expert once, pad to the largest group, run every expert in
-    #               two torch.bmm calls. One kernel instead of E.
-    moe_dispatch: str = "loop"
-    # Only used by moe_dispatch="compiled": per-expert slots as a multiple of the balanced
-    # share. 1.25 is huge margin given QB holds MaxVio ~0.02; dropped_tokens verifies it.
-    moe_capacity_factor: float = 1.25
 
 
 def norm(x):
@@ -158,31 +149,6 @@ class MLP(nn.Module):
 
 
 class MoEMLP(nn.Module):
-    """Routed Mixture-of-Experts FFN. Drop-in replacement for MLP.
-
-    Each expert is an unmodified nanochat MLP, so the only structural change versus dense is
-    the router plus the replication. Load balancing is Quantile Balancing (QB), which is
-    hyperparameter-free: no aux loss, no update-rate constant to tune.
-
-    QB (Jianlin Su, https://kexue.fm/archives/11619; scaled up by Marin, see
-    https://openathena.ai/blog/quantile-balancing/). Routing selects the top-k of
-    `router_logits + router_bias`, and each step recomputes the bias in closed form:
-
-      1. Per token, the threshold to be selected is alpha_t = the (k+1)-th largest biased
-         logit. Expert e is selected for token t iff  logits[t,e] + bias[e] > alpha_t.
-      2. So expert e is selected iff  logits[t,e] - alpha_t > -bias[e]. Setting -bias[e] to
-         the (N*k/E)-th largest value of (logits[:,e] - alpha) therefore activates exactly the
-         balanced number of tokens N*k/E, by construction.
-
-    Betas are computed during step n and applied at step n+1 (matching the reference, which
-    pipelines them through the training state) — see GPT.apply_qb_update.
-
-    This is the naive dispatch: a Python loop over experts with gather/scatter. It does exactly
-    top_k experts' worth of FLOPs (unlike a masked dense loop, which does n_expert's worth) and
-    it is dropless — no capacity factor, no token dropping. The faster path would be stacked
-    expert weights plus a grouped/ragged matmul; see README before reaching for it.
-    """
-
     def __init__(self, config):
         super().__init__()
         self.n_expert = config.n_expert
@@ -190,52 +156,23 @@ class MoEMLP(nn.Module):
         assert 1 <= self.top_k < self.n_expert, "top_k must be in [1, n_expert), we need a (k+1)-th logit for the QB threshold"
         self.router = Linear(config.n_embd, config.n_expert, bias=False)
         self.experts = nn.ModuleList([MLP(config) for _ in range(config.n_expert)])
-        # Routing bias: set by QB, never by the optimizer, so a buffer rather than a Parameter.
-        # Persistent so that resuming a run restores the balanced routing state.
+        # A buffer, not a Parameter: QB solves for this in closed form each step, so the
+        # optimizer must never touch it. Saved with the checkpoint so a resumed run picks up
+        # already balanced instead of reconverging.
         self.register_buffer("router_bias", torch.zeros(config.n_expert))
-        # QB accumulators. Betas are averaged over the gradient-accumulation micro-steps of one
-        # optimizer step, which is the single-GPU analogue of the reference's pmean over shards.
+        # Scratch for the QB solve, averaged over the micro-steps of one optimizer step.
+        # Not saved: it is meaningless outside the step it was accumulated in.
         self.register_buffer("qb_beta_sum", torch.zeros(config.n_expert), persistent=False)
         self.register_buffer("qb_beta_count", torch.zeros(()), persistent=False)
-        # Per-expert token counts, for the "expert load over training" plot.
+        # How many tokens each expert saw, for the load plot.
         self.register_buffer("expert_counts", torch.zeros(config.n_expert, dtype=torch.long), persistent=False)
-        # Routing-quality telemetry. Nothing here feeds training; it exists so wandb can show
-        # whether the *router* is learning, which per-expert load alone cannot tell you: a
-        # perfectly balanced run and a run where the router has collapsed to noise both show
-        # MaxVio ~ 0. Reset together with expert_counts by GPT.expert_load().
-        self.register_buffer("stat_entropy_sum", torch.zeros(()), persistent=False)
-        self.register_buffer("stat_gate_sum", torch.zeros(()), persistent=False)
-        self.register_buffer("stat_count", torch.zeros(()), persistent=False)
-        # Pick the dispatch implementation once, at construction. Both are numerically
-        # identical (tests/test_moe.py::test_batched_dispatch_matches_loop pins this).
-        assert config.moe_dispatch in ("loop", "batched", "compiled", "permute", "grouped"), f"unknown moe_dispatch: {config.moe_dispatch}"
-        self.capacity_factor = config.moe_capacity_factor
-        self.register_buffer("dropped_tokens", torch.zeros((), dtype=torch.long), persistent=False)
-        self._dispatch = {
-            "loop": self._dispatch_loop,
-            "batched": self._dispatch_batched,
-            "compiled": self._dispatch_compiled,
-            "permute": self._dispatch_permute,
-            "grouped": self._dispatch_grouped,
-        }[config.moe_dispatch]
 
     @torch._dynamo.disable
     def _dispatch_grouped(self, xf, idx, gate):
-        """One CUTLASS grouped GEMM for all experts, with ragged group sizes.
+        # Sort the (token, expert) pairs by expert, then run every expert in a single grouped
+        # GEMM. The kernel takes per-expert group boundaries, so the groups can be different
+        # sizes: no padding, no capacity limit, and nothing is dropped. Needs a Hopper GPU.
 
-        torch._grouped_mm takes a single (total_tokens, K) activation matrix plus per-expert
-        weights (E, K, N) and an `offs` tensor of group boundaries, and runs every expert in one
-        kernel with *variable* group sizes. That removes all three problems the earlier variants
-        traded between:
-
-          - no padding, so no wasted math (unlike bmm to max(counts), ~2% waste)
-          - no capacity factor, so no dropped tokens (unlike the CF=1.0 variant, 4.0% dropped)
-          - one kernel instead of E, so the host stops starving the device
-            (the occupancy probe measured the loop at 30.4% GPU-busy, 57k launches/step)
-
-        Measured standalone on H100: 6.46e14 FLOP/s (65.3% of peak) versus 4.99e14 (50.5%) for
-        the padded bmm doing identical work.
-        """
         N, C = xf.shape
         E, k = self.n_expert, self.top_k
         flat = idx.reshape(-1)
@@ -255,244 +192,49 @@ class MoEMLP(nn.Module):
         out.index_add_(0, rows, y)
         return out
 
-    @torch._dynamo.disable
-    def _dispatch_permute(self, xf, idx, gate):
-        """Like _dispatch_batched, but the combine is a permutation + local sum instead of a
-        duplicate-index scatter-add.
-
-        The profiler found aten::_index_put_impl_ and indexing_backward_kernel together taking
-        ~40% of step time. The cause is that `out.index_add_(0, token_of, y)` has *duplicate*
-        indices -- each token appears top_k times -- so the forward needs atomics and, worse,
-        PyTorch's backward sorts the index tensor to stay deterministic.
-
-        Nothing forces that. Un-permuting into (token, slot) order is a bijection, so
-        index_copy_ with unique indices does it without atomics, and the k outputs per token
-        are then summed with a plain reduction over a length-k axis:
-
-            index_add_(duplicate idx)  ->  index_copy_(unique idx) + .view(N, k, C).sum(1)
-
-        Same arithmetic, same result; only the memory-access pattern changes.
-        """
-        N, C = xf.shape
-        E, k = self.n_expert, self.top_k
-        flat = idx.reshape(-1)
-        order = torch.argsort(flat, stable=True)
-        counts = torch.bincount(flat, minlength=E)
-        cap = int(counts.max())
-
-        starts = torch.cumsum(counts, 0) - counts
-        rank = torch.arange(flat.numel(), device=xf.device) - starts[flat[order]]
-        dest = flat[order] * cap + rank
-
-        src = torch.zeros(E * cap, dtype=torch.long, device=xf.device)
-        src[dest] = order
-        filled = torch.zeros(E * cap, dtype=torch.bool, device=xf.device)
-        filled[dest] = True
-
-        xg = xf[src // k].view(E, cap, C)
-        w_fc = torch.stack([e.c_fc.weight for e in self.experts]).to(xg.dtype)
-        w_proj = torch.stack([e.c_proj.weight for e in self.experts]).to(xg.dtype)
-        h = F.relu(torch.bmm(xg, w_fc.mT)).square()
-        y = torch.bmm(h, w_proj.mT).view(E * cap, C) * filled.unsqueeze(-1)
-
-        # scatter back to (token, slot) order -- `order` is a permutation, so no duplicates
-        y_pairs = torch.zeros(N * k, C, dtype=y.dtype, device=xf.device)
-        y_pairs.index_copy_(0, src[filled], y[filled])
-        return (y_pairs.view(N, k, C) * gate.unsqueeze(-1)).sum(1)
-
-    def _dispatch_compiled(self, xf, idx, gate):
-        """Static-shape dispatch, so torch.compile can enter the region and FUSE.
-
-        The profiler said elementwise ops were ~35% of step time while matmul was ~50% and the
-        gather/scatter itself only ~5%. That points at fusion, not at the dispatch: inside every
-        expert, relu / square / gate-multiply / scatter are each their own kernel because the
-        other two dispatch paths are @torch._dynamo.disable'd. Compiled, they collapse.
-
-        The only reason those paths are disabled is that torch.where and max(counts) produce
-        data-dependent shapes. Here every shape is a compile-time constant: capacity is fixed at
-        ceil(N*k/E * capacity_factor), and overflow is routed to a sentinel slot that is sliced
-        off rather than filtered out (filtering would reintroduce a data-dependent shape).
-
-        The tradeoff is honest: this is no longer strictly dropless. A token whose expert is
-        already full is dropped. With QB holding MaxVio at ~0.019, a capacity factor of 1.25
-        has enormous margin -- and `dropped_tokens` counts them so the assumption is checked
-        rather than asserted.
-        """
-        N, C = xf.shape
-        E, k = self.n_expert, self.top_k
-        cap = max(1, int(math.ceil(N * k / E * self.capacity_factor)))
-
-        flat = idx.reshape(-1)                                   # (N*k,) expert per (tok, slot)
-        # rank of each pair within its expert, via one-hot cumsum: static shapes throughout,
-        # unlike argsort+bincount which needs max(counts) to size the grid.
-        onehot = F.one_hot(flat, E).to(torch.int32)              # (N*k, E)
-        rank = (onehot.cumsum(0) - 1).gather(1, flat.unsqueeze(1)).squeeze(1)
-        keep = rank < cap
-        # overflow goes to slot E*cap, a sentinel row we slice away below
-        slot = torch.where(keep, flat * cap + rank, E * cap)
-
-        pair_tok = torch.arange(N * k, device=xf.device) // k     # (N*k,) owning token
-        grid_tok = torch.zeros(E * cap + 1, dtype=torch.long, device=xf.device)
-        grid_tok.scatter_(0, slot, pair_tok)
-        grid_gate = torch.zeros(E * cap + 1, dtype=gate.dtype, device=xf.device)
-        grid_gate.scatter_(0, slot, gate.reshape(-1))
-        grid_tok, grid_gate = grid_tok[:E * cap], grid_gate[:E * cap]
-
-        xg = xf[grid_tok].view(E, cap, C)
-        w_fc = torch.stack([e.c_fc.weight for e in self.experts]).to(xg.dtype)
-        w_proj = torch.stack([e.c_proj.weight for e in self.experts]).to(xg.dtype)
-        h = F.relu(torch.bmm(xg, w_fc.mT)).square()
-        y = torch.bmm(h, w_proj.mT).view(E * cap, C)
-
-        if self.training:
-            self.dropped_tokens += (~keep).sum()
-        out = torch.zeros_like(xf)
-        out.index_add_(0, grid_tok, y * grid_gate.unsqueeze(-1))
-        return out
-
-    @torch._dynamo.disable
-    def _dispatch_batched(self, xf, idx, gate):
-        """All experts in two bmm calls instead of a Python loop over E of them.
-
-        Layout: sort the (token, slot) pairs by assigned expert, pad every expert's group to
-        the size of the largest one, and view the result as (E, cap, d) so a single batched
-        matmul covers all experts. Two kernels per layer instead of ~5E.
-
-        Padding to max(counts) rather than a fixed capacity is what keeps this **dropless** --
-        no token is ever discarded. That is only affordable because QB holds the load to within
-        ~2% of uniform (measured MaxVio 0.019), so cap is barely above the mean and the wasted
-        compute is a couple of percent. With a badly balanced router this layout would be the
-        wrong choice, which is the direct link between the load balancer and the kernel.
-
-        The expert weights stay as separate 2D nn.Linear modules and are stacked here on the
-        fly. Storing them as one 3D (E, d, d_ff) Parameter would be the obvious design, but
-        Muon groups parameters by shape and stacks them, and its second_momentum_buffer is
-        built as (chunk, shape[-2], 1) -- which cannot broadcast against a 4D (chunk, E, d,
-        d_ff) gradient (see optim.py). Keeping them 2D leaves the optimizer untouched; the
-        stack costs one contiguous copy of the expert weights per layer, ~0.05% of step time,
-        and autograd routes the gradients back to the individual weights unchanged.
-        """
-        N, C = xf.shape
-        E, k = self.n_expert, self.top_k
-        flat = idx.reshape(-1)                                   # (N*k,) expert per (tok, slot)
-        order = torch.argsort(flat, stable=True)                 # group by expert
-        counts = torch.bincount(flat, minlength=E)               # (E,)
-        cap = int(counts.max())                                  # dropless: fit the largest group
-
-        # rank of each sorted element inside its own expert group -> its slot in the (E, cap) grid
-        starts = torch.cumsum(counts, 0) - counts                # (E,)
-        rank = torch.arange(flat.numel(), device=xf.device) - starts[flat[order]]
-        dest = flat[order] * cap + rank                          # (N*k,)
-
-        # grid -> source (token, slot). Unfilled padding slots keep gate 0, so they contribute
-        # nothing to the scatter-add and their (garbage) inputs are harmless.
-        src = torch.zeros(E * cap, dtype=torch.long, device=xf.device)
-        src[dest] = order
-        gate_grid = torch.zeros(E * cap, dtype=gate.dtype, device=xf.device)
-        gate_grid[dest] = gate.reshape(-1)[order]
-
-        token_of = src // k                                      # (E*cap,) row of xf to read
-        xg = xf[token_of].view(E, cap, C)
-
-        # Stack to (E, d_ff, d); .mT gives cuBLAS the transposed operand without a copy.
-        w_fc = torch.stack([e.c_fc.weight for e in self.experts]).to(xg.dtype)
-        w_proj = torch.stack([e.c_proj.weight for e in self.experts]).to(xg.dtype)
-        h = torch.bmm(xg, w_fc.mT)                               # (E, cap, d_ff)
-        h = F.relu(h).square()
-        y = torch.bmm(h, w_proj.mT).view(E * cap, C)             # (E, cap, d) -> (E*cap, d)
-
-        out = torch.zeros_like(xf)
-        out.index_add_(0, token_of, y * gate_grid.unsqueeze(-1))
-        return out
-
-    @torch._dynamo.disable
-    def _dispatch_loop(self, xf, idx, gate):
-        """Gather tokens per expert, run them, scatter-add the weighted results back.
-
-        Dynamo-disabled on purpose: `torch.where` has a data-dependent output shape, so under
-        torch.compile this region would either graph-break anyway or trigger a recompile on
-        every step as the per-expert token counts drift. The tensors crossing this boundary
-        (xf, idx, gate, out) are all statically shaped, so the rest of the model still compiles.
-        """
-        out = torch.zeros_like(xf)
-        for e, expert in enumerate(self.experts):
-            tok, slot = torch.where(idx == e)
-            # Deliberately no `if tok.numel() == 0: continue`. An expert that receives no tokens
-            # this micro-batch must still get a (zero) .grad, because Muon does
-            # torch.stack([p.grad for p in group]) and a None would crash the optimizer step.
-            # An empty matmul produces exactly that zero gradient, so just always run it.
-            y = expert(xf[tok])
-            out.index_add_(0, tok, y * gate[tok, slot].unsqueeze(-1))
-        return out
-
     def forward(self, x):
         B, T, C = x.shape
         xf = x.view(-1, C)
-        # Router stays in fp32 through top-k and the QB statistics (as in the reference):
-        # the betas are quantiles of logit differences and bf16 ties would quantise them badly.
+        # fp32 for the router. QB works with quantiles of logit differences, and in bf16 too
+        # many of those differences round to the same value.
         logits = self.router(xf).float()                                  # (N, E)
         biased = logits + self.router_bias
-        # Top-(k+1): the extra entry is the QB threshold alpha, not a routed expert.
+        # Take k+1. The extra one is not a routed expert, it is the threshold QB needs.
         topk_vals, topk_idx = torch.topk(biased, self.top_k + 1, dim=-1)  # (N, k+1)
         alpha = topk_vals[:, -1:]                                         # (N, 1)
         idx = topk_idx[:, :self.top_k]                                    # (N, k)
-        # Combine weights are a sigmoid of the *unbiased* logits, unnormalised. The bias exists
-        # only to steer selection; letting it through to the weights would distort the output.
-        # This is also the router's ONLY gradient path (top-k selection is not differentiable).
-        # Note it is exactly zero on step 0: nanochat zero-inits every c_proj, so expert outputs
-        # start at 0 and dL/dgate = expert_output = 0. The router starts learning once c_proj
-        # moves off zero, one optimizer step later. QB does not care — it reads logits directly,
-        # so load balancing is active from step 0 regardless.
+        # Gates come from the unbiased logits. The bias picks which experts run; letting it
+        # through here would change their outputs too. This is also the router's only path to
+        # a gradient, since top-k selection is not differentiable.
         gate = torch.sigmoid(logits.gather(1, idx)).to(x.dtype)           # (N, k)
-        out = self._dispatch(xf, idx, gate)
+        out = self._dispatch_grouped(xf, idx, gate)
         if self.training:
             self._accumulate_qb(logits.detach(), alpha.detach(), idx)
-            self._accumulate_telemetry(logits.detach(), gate.detach(), idx)
+            self.expert_counts += torch.bincount(idx.detach().flatten(), minlength=self.n_expert)
         return out.view(B, T, C)
 
     @torch.no_grad()
     def _accumulate_qb(self, logits, alpha, idx):
+        # An expert is picked for a token when its logit beats that token's threshold alpha.
+        # So for each expert, the bias that would hand it exactly its fair share is the
+        # fair-share-th largest of (its logit - alpha) over the batch. No loss, no tuning.
         s_minus_alpha = logits - alpha                                    # (N, E)
         n_tok = s_minus_alpha.size(0)
         balanced = max(1, n_tok * self.top_k // self.n_expert)  # tokens each expert should get
-        # beta[e] = the `balanced`-th largest of (logits[:,e] - alpha), i.e. the bias magnitude
-        # that would hand expert e exactly its fair share of this batch.
         beta = torch.topk(s_minus_alpha.t(), balanced, dim=-1).values[:, -1]  # (E,)
         self.qb_beta_sum += beta
         self.qb_beta_count += 1
 
     @torch.no_grad()
-    def _accumulate_telemetry(self, logits, gate, idx):
-        """Pure logging: per-expert counts plus two scalars that describe routing *quality*.
-
-        - entropy of softmax(router logits), in nats. ln(n_expert) means the router is
-          undecided (uniform); a falling curve is the router committing to a specialisation.
-          Note this is the entropy of the *unbiased* logits, so it measures what the router
-          has learned, not what QB's bias forced it to do.
-        - mean of the sigmoid gate on the selected experts, i.e. how strongly the chosen
-          experts are actually allowed to contribute. It starts at ~0.5 (zero-init c_proj =>
-          zero logits) and a collapse toward 0 means the MoE layers are being switched off.
-
-        Costs one softmax over an (n_tok, n_expert) fp32 tensor per micro-step; with E=8 that
-        is far below the noise floor of the dispatch loop it sits next to.
-        """
-        self.expert_counts += torch.bincount(idx.flatten(), minlength=self.n_expert)
-        p = torch.softmax(logits, dim=-1)
-        self.stat_entropy_sum += -(p * torch.log(p.clamp_min(1e-9))).sum(-1).mean()
-        self.stat_gate_sum += gate.float().mean()
-        self.stat_count += 1
-
-    @torch.no_grad()
     def apply_qb_update(self):
-        """Fold the accumulated betas into router_bias. Call once per optimizer step."""
         if self.qb_beta_count.item() == 0:
             return
         beta = self.qb_beta_sum / self.qb_beta_count
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(beta, op=dist.ReduceOp.AVG)
         bias = -beta
-        # Mean-centre: top-k over experts is invariant to a constant shift, so this only keeps
-        # the bias from drifting off to a large common value over a long run.
+        # Adding a constant to every expert changes nothing about which ones win the top-k,
+        # so subtract the mean and keep the whole vector from wandering over a long run.
         self.router_bias.copy_(bias - bias.mean())
         self.qb_beta_sum.zero_()
         self.qb_beta_count.zero_()
@@ -586,11 +328,11 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             if isinstance(block.mlp, MoEMLP):
-                # Router gets the standard matrix init: with rms-normed inputs this puts the
-                # logits at roughly unit scale, which breaks routing symmetry at step 0. A zero
-                # init would send every token to experts 0..k-1 and leave QB to dig it out.
+                # Standard matrix init, not zeros. Inputs are rms-normed, so this lands the
+                # logits near unit scale and the experts start out distinguishable. Zeros would
+                # send every token to experts 0..k-1 and make QB dig its way out.
                 torch.nn.init.uniform_(block.mlp.router.weight, -s, s)
-                # Buffers are meta tensors until to_empty(), so their contents are garbage here.
+                # Until to_empty() runs these are meta tensors holding garbage.
                 block.mlp.router_bias.zero_()
                 block.mlp.qb_beta_sum.zero_()
                 block.mlp.qb_beta_count.zero_()
@@ -754,42 +496,6 @@ class GPT(nn.Module):
                 if reset:
                     block.mlp.expert_counts.zero_()
         return torch.stack(counts) if counts else None
-
-    @torch.no_grad()
-    def routing_stats(self, reset=True):
-        """Router-quality scalars since the last call, averaged over MoE layers.
-
-        `expert_load` answers "is the load balanced"; this answers "is the router learning
-        anything". They fail independently — a router collapsed to noise still balances
-        perfectly under QB — so the plots are only diagnostic when read together.
-
-        Returns None on a dense model, or if no training micro-step has run since the reset.
-        """
-        ent = gate = n = 0.0
-        bias_absmax = 0.0
-        layers = 0
-        for block in self.transformer.h:
-            if not isinstance(block.mlp, MoEMLP):
-                continue
-            m = block.mlp
-            if m.stat_count.item() == 0:
-                continue
-            ent += (m.stat_entropy_sum / m.stat_count).item()
-            gate += (m.stat_gate_sum / m.stat_count).item()
-            bias_absmax = max(bias_absmax, m.router_bias.abs().max().item())
-            layers += 1
-            if reset:
-                m.stat_entropy_sum.zero_()
-                m.stat_gate_sum.zero_()
-                m.stat_count.zero_()
-        if layers == 0:
-            return None
-        return {
-            "router_entropy": ent / layers,          # nats; ln(n_expert) == undecided
-            "router_entropy_frac": ent / layers / math.log(self.config.n_expert),  # 0..1
-            "gate_mean": gate / layers,
-            "router_bias_absmax": bias_absmax,       # how hard QB is having to push
-        }
 
     def estimate_decode_flops(self, context_len):
         """

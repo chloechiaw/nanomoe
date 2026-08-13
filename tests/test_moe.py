@@ -7,7 +7,7 @@ Run on CPU: python -m pytest tests/test_moe.py -v
 import pytest
 import torch
 
-from nanochat.gpt import GPT, GPTConfig, MLP, MoEMLP
+from nanomoe.gpt import GPT, GPTConfig, MLP, MoEMLP
 
 
 def make_config(n_expert=8, top_k=2, n_layer=2, n_embd=64, vocab_size=256):
@@ -61,7 +61,7 @@ def test_active_param_accounting():
     total = model.num_matmul_params()
     active = model.num_active_matmul_params()
     # one expert's worth of params, times the number of layers, times the inactive count
-    from nanochat.gpt import Linear
+    from nanomoe.gpt import Linear
     per_expert = sum(m.weight.numel() for m in model.transformer.h[0].mlp.experts[0].modules()
                      if isinstance(m, Linear))
     expected = total - (n_expert - top_k) * per_expert * len(model.transformer.h)
@@ -148,70 +148,12 @@ def test_expert_with_zero_tokens_still_gets_a_gradient():
         assert block.mlp.experts[3].c_fc.weight.grad.abs().sum() == 0
 
 
-@pytest.mark.parametrize("mode", ["batched", "permute", "grouped"])
-def test_all_dispatch_modes_match_loop(mode):
-    """Every *dropless* dispatch variant must be arithmetically identical to the reference
-    loop. They differ only in memory-access pattern, so any drift means a speed number is
-    measuring the wrong computation.
-
-    "compiled" is deliberately excluded: it pads to a fixed capacity, so tokens overflowing a
-    full expert are dropped and its output legitimately differs from the loop whenever routing
-    is imbalanced (e.g. at init, before QB has converged). That is the tradeoff it makes for
-    static shapes -- and having measured it ~2x slower, the tradeoff buys nothing."""
-    torch.manual_seed(0)
-    ref_cfg = make_config(n_expert=8, top_k=2, n_layer=2, n_embd=64)
-    alt_cfg = make_config(n_expert=8, top_k=2, n_layer=2, n_embd=64)
-    alt_cfg.moe_dispatch = mode
-
-    torch.manual_seed(1234)
-    ref = build(ref_cfg)
-    torch.manual_seed(1234)
-    alt = build(alt_cfg)
-    with torch.no_grad():
-        for blk in ref.transformer.h:
-            for e in blk.mlp.experts:
-                e.c_proj.weight.normal_(std=0.02)   # off the zero init so experts contribute
-    alt.load_state_dict(ref.state_dict())
-    ref.eval(); alt.eval()
-
-    idx = torch.randint(0, ref_cfg.vocab_size, (3, ref_cfg.sequence_len))
-    with torch.no_grad():
-        torch.testing.assert_close(ref(idx), alt(idx), rtol=1e-4, atol=1e-5)
-
-
-def test_batched_dispatch_matches_loop():
-    """The kernel's whole justification is that it changes only *how many* kernels launch,
-    not the math. If this drifts, every speed number it produces is meaningless."""
-    torch.manual_seed(0)
-    cfg_loop = make_config(n_expert=8, top_k=2, n_layer=2, n_embd=64)
-    cfg_batched = make_config(n_expert=8, top_k=2, n_layer=2, n_embd=64)
-    cfg_batched.moe_dispatch = "batched"
-
-    torch.manual_seed(1234)
-    a = build(cfg_loop)
-    torch.manual_seed(1234)
-    b = build(cfg_batched)
-    b.load_state_dict(a.state_dict())          # identical weights, different dispatch
-    # nudge c_proj off its zero init so the experts actually contribute
-    with torch.no_grad():
-        for m in (a, b):
-            for blk in m.transformer.h:
-                for e in blk.mlp.experts:
-                    e.c_proj.weight.normal_(std=0.02)
-        b.load_state_dict(a.state_dict())
-    a.eval(); b.eval()
-
-    idx = torch.randint(0, cfg_loop.vocab_size, (3, cfg_loop.sequence_len))
-    with torch.no_grad():
-        torch.testing.assert_close(a(idx), b(idx), rtol=1e-4, atol=1e-5)
-
-
-def test_batched_dispatch_is_dropless_under_imbalance():
-    """Padding is to max(counts), not a fixed capacity, so even a badly skewed router must
-    still route every token. A capacity-factor implementation would silently drop here."""
+def test_grouped_dispatch_is_dropless_under_imbalance():
+    """Group sizes are the true per-expert counts, not a fixed capacity, so even a badly
+    skewed router must still route every token. A capacity-factor implementation would
+    silently drop here."""
     torch.manual_seed(0)
     cfg = make_config(n_expert=8, top_k=2, n_layer=1, n_embd=64)
-    cfg.moe_dispatch = "batched"
     model = build(cfg)
     moe = model.transformer.h[0].mlp
     with torch.no_grad():

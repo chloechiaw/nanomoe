@@ -7,10 +7,10 @@ import json
 import logging
 import torch
 
-from nanochat.common import get_base_dir
-from nanochat.gpt import GPT, GPTConfig
-from nanochat.tokenizer import get_tokenizer
-from nanochat.common import setup_default_logging
+from nanomoe.common import get_base_dir
+from nanomoe.gpt import GPT, GPTConfig
+from nanomoe.tokenizer import get_tokenizer
+from nanomoe.common import setup_default_logging
 
 # Set up logging
 setup_default_logging()

@@ -4,9 +4,8 @@ Unified evaluation script for base models.
 Supports three evaluation modes (comma-separated):
   --eval core    : CORE metric (accuracy on ICL tasks)
   --eval bpb     : Bits per byte on train/val splits
-  --eval sample  : Generate samples from the model
 
-Default is all three: --eval core,bpb,sample
+Default is both: --eval core,bpb
 
 Examples:
 
@@ -28,13 +27,12 @@ import tempfile
 import argparse
 import torch
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
-from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import load_model
-from nanochat.core_eval import evaluate_task
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.loss_eval import evaluate_bpb
-from nanochat.engine import Engine
+from nanomoe.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
+from nanomoe.tokenizer import get_token_bytes
+from nanomoe.checkpoint_manager import load_model
+from nanomoe.core_eval import evaluate_task
+from nanomoe.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanomoe.loss_eval import evaluate_bpb
 
 # -----------------------------------------------------------------------------
 # CORE evaluation
@@ -127,7 +125,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
 
 def main():
     parser = argparse.ArgumentParser(description="Base model evaluation")
-    parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
+    parser.add_argument('--eval', type=str, default='core,bpb', help='Comma-separated evaluations to run: core,bpb (default: both)')
     parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
@@ -138,7 +136,7 @@ def main():
 
     # Parse evaluation modes
     eval_modes = set(mode.strip() for mode in args.eval.split(','))
-    valid_modes = {'core', 'bpb', 'sample'}
+    valid_modes = {'core', 'bpb'}
     invalid = eval_modes - valid_modes
     if invalid:
         parser.error(f"Invalid eval modes: {invalid}. Valid: {valid_modes}")
@@ -159,44 +157,8 @@ def main():
     # Results to log
     core_results = None
     bpb_results = {}
-    samples = []
-    unconditioned_samples = []
 
-    # --- Sampling ---
-    if 'sample' in eval_modes:
-        print0("\n" + "="*80)
-        print0("Model Samples")
-        print0("="*80)
-        if ddp_rank == 0:
-            prompts = [
-                "The capital of France is",
-                "The chemical symbol of gold is",
-                "If yesterday was Friday, then tomorrow will be",
-                "The opposite of hot is",
-                "The planets of the solar system are:",
-                "My favorite color is",
-                "If 5*x + 3 = 13, then x is",
-            ]
-            engine = Engine(model, tokenizer)
-            print0("\nConditioned samples:")
-            for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-                sample_str = tokenizer.decode(sample[0])
-                print0("-" * 80)
-                print0(sample_str)
-                samples.append(sample_str)
-
-            print0("\nUnconditioned samples:")
-            tokens = tokenizer("", prepend="<|bos|>")
-            uncond, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
-            for sample in uncond:
-                sample_str = tokenizer.decode(sample)
-                print0("-" * 80)
-                print0(sample_str)
-                unconditioned_samples.append(sample_str)
-
-    # --- BPB evaluation ---
+    # --- BPB ---
     if 'bpb' in eval_modes:
         print0("\n" + "="*80)
         print0("BPB Evaluation")

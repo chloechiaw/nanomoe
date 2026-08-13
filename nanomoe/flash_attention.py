@@ -5,7 +5,7 @@ Exports `flash_attn` module that matches the FA3 API exactly, but falls back
 to PyTorch SDPA on incompatible CUDA GPUs, MPS, and CPU.
 
 Usage (drop-in replacement for FA3):
-    from nanochat.flash_attention import flash_attn
+    from nanomoe.flash_attention import flash_attn
 
     # Training (no KV cache)
     y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
@@ -31,19 +31,11 @@ def _load_flash_attention_3():
         import os
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         from kernels import get_kernel, has_kernel
-        # Upstream hardcodes varunneal/flash-attention-3 for Hopper with no fallback, but that
-        # HF org now 404s -- which silently cost us FA3 on H100 and forced SDPA (and therefore
-        # --window-pattern=L) on a GPU that FA3 targets natively. Try it, then fall through to
-        # the community build rather than giving up.
-        candidates = ["varunneal/flash-attention-3"] if major == 9 else []
-        candidates.append("kernels-community/flash-attn3")
-        for hf_kernel in candidates:
-            try:
-                if not has_kernel(hf_kernel):
-                    continue
-                return get_kernel(hf_kernel).flash_attn_interface
-            except Exception:
-                continue
+        # kernels >= 0.16 wants an explicit API version. Without it this raises and the except
+        # below quietly turns that into an SDPA fallback, even on a card FA3 supports.
+        hf_kernel = "kernels-community/flash-attn3"
+        if has_kernel(hf_kernel, version=1):
+            return get_kernel(hf_kernel, version=1).flash_attn_interface
         return None
 
     except Exception:
@@ -66,7 +58,7 @@ def _resolve_use_fa3():
         return False
     if HAS_FA3:
         # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use SDPA fallback
-        from nanochat.common import COMPUTE_DTYPE
+        from nanomoe.common import COMPUTE_DTYPE
         if COMPUTE_DTYPE == torch.bfloat16:
             return True
         return False

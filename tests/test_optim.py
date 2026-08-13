@@ -16,7 +16,7 @@ cuda_available = torch.cuda.is_available()
 pytestmark = pytest.mark.skipif(not cuda_available, reason="optimizer tests require CUDA")
 
 if cuda_available:
-    from nanochat.optim import MuonAdamW
+    from nanomoe.optim import MuonAdamW
 
 DEVICE = "cuda"
 

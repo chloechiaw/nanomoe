@@ -1,5 +1,5 @@
 """
-Common utilities for nanochat.
+Common utilities for nanoMoE.
 """
 
 import os
@@ -219,8 +219,6 @@ class DummyWandb:
         pass
     def log(self, *args, **kwargs):
         pass
-    def get_url(self):
-        return None
     def finish(self):
         pass
 
