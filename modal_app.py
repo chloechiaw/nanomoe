@@ -41,14 +41,15 @@ HOURS = 60 * 60
 # -----------------------------------------------------------------------------
 # Image
 #
-# torch 2.9.1 from PyPI already ships the CUDA 12.8 runtime for linux/x86_64, so there is no
-# need for the pytorch wheel index. build-essential is required by torch.compile's inductor
-# backend, which shells out to a C++ compiler for the generated wrapper code.
+# torch 2.13 from the cu129 wheel index. Measured slightly faster than 2.9.1+cu128
+# (28.6% vs 28.0% MFU at the training config) and FA3 still loads.
+# build-essential is required by torch.compile's inductor backend, which shells out to a C++
+# compiler for the generated wrapper code.
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "build-essential")
-    .pip_install("torch==2.9.1")
+    .pip_install("torch==2.13.0", index_url="https://download.pytorch.org/whl/cu129")
     .pip_install(
         # pyproject.toml's set, plus the two it uses but does not declare:
         # requests (nanomoe/dataset.py) and pyyaml (scripts/base_eval.py).

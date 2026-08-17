@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from nanomoe.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanomoe.optim import MuonAdamW
+from nanomoe.kernels import gate_combine
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanomoe.flash_attention import flash_attn
@@ -151,7 +152,14 @@ class MoEMLP(nn.Module):
         self.top_k = config.top_k
         assert 1 <= self.top_k < self.n_expert, "top_k must be in [1, n_expert), we need a (k+1)-th logit for the QB threshold"
         self.router = Linear(config.n_embd, config.n_expert, bias=False)
-        self.experts = nn.ModuleList([MLP(config) for _ in range(config.n_expert)])
+        # Experts are one stacked 3D tensor per projection, in nn.Linear's (out, in) order with
+        # an expert dim in front. Storing them separately and stacking in forward would copy
+        # every expert weight on every micro-step, and would keep the block out of the compiled
+        # graph. Muon's Polar Express works on the last two dims, so each expert is
+        # orthogonalized independently.
+        d_ff = 4 * config.n_embd
+        self.c_fc = nn.Parameter(torch.empty(config.n_expert, d_ff, config.n_embd))
+        self.c_proj = nn.Parameter(torch.empty(config.n_expert, config.n_embd, d_ff))
         # A buffer, not a Parameter: QB solves for this in closed form each step, so the
         # optimizer must never touch it. Saved with the checkpoint so a resumed run picks up
         # already balanced instead of reconverging.
@@ -163,7 +171,6 @@ class MoEMLP(nn.Module):
         # How many tokens each expert saw, for the load plot.
         self.register_buffer("expert_counts", torch.zeros(config.n_expert, dtype=torch.long), persistent=False)
 
-    @torch._dynamo.disable
     def _dispatch_grouped(self, xf, idx, gate):
         # Sort the (token, expert) pairs by expert, then run every expert in a single grouped
         # GEMM. The kernel takes per-expert group boundaries, so the groups can be different
@@ -178,15 +185,15 @@ class MoEMLP(nn.Module):
 
         rows = order // k                                 # token owning each sorted pair
         xg = xf[rows]                                     # (N*k, C), expert-major order
-        w_fc = torch.stack([e.c_fc.weight for e in self.experts]).to(xg.dtype).transpose(1, 2)
-        w_proj = torch.stack([e.c_proj.weight for e in self.experts]).to(xg.dtype).transpose(1, 2)
+        # grouped_mm wants (E, K, N), i.e. the transpose of the (out, in) storage order
+        w_fc = self.c_fc.to(xg.dtype).transpose(1, 2)
+        w_proj = self.c_proj.to(xg.dtype).transpose(1, 2)
         h = F.relu(torch._grouped_mm(xg, w_fc, offs=offs)).square()
         y = torch._grouped_mm(h, w_proj, offs=offs)       # (N*k, C)
 
-        y = y * gate.reshape(-1)[order].unsqueeze(-1)
-        out = torch.zeros_like(xf)
-        out.index_add_(0, rows, y)
-        return out
+        # fused gate-multiply + scatter-add (nanomoe/kernels.py); eager fallback off-GPU
+        gate_o = gate.reshape(-1)[order]
+        return gate_combine(y, gate_o, order, rows, N)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -315,9 +322,8 @@ class GPT(nn.Module):
                 block.mlp.qb_beta_sum.zero_()
                 block.mlp.qb_beta_count.zero_()
                 block.mlp.expert_counts.zero_()
-                for expert in block.mlp.experts:
-                    torch.nn.init.uniform_(expert.c_fc.weight, -s * 0.4, s * 0.4)
-                    torch.nn.init.zeros_(expert.c_proj.weight)
+                torch.nn.init.uniform_(block.mlp.c_fc, -s * 0.4, s * 0.4)
+                torch.nn.init.zeros_(block.mlp.c_proj)
             else:
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
@@ -410,13 +416,16 @@ class GPT(nn.Module):
 
     def num_matmul_params(self):
         matmul_params = sum(m.weight.numel() for m in self.modules() if isinstance(m, Linear))
+        # expert weights are bare Parameters, not Linear modules, so add them explicitly
+        matmul_params += sum(m.c_fc.numel() + m.c_proj.numel()
+                             for m in self.modules() if isinstance(m, MoEMLP))
         return matmul_params
 
     def num_active_matmul_params(self):
         active = self.num_matmul_params()
         for block in self.transformer.h:
             if isinstance(block.mlp, MoEMLP):
-                per_expert = sum(m.weight.numel() for m in block.mlp.experts[0].modules() if isinstance(m, Linear))
+                per_expert = (block.mlp.c_fc[0].numel() + block.mlp.c_proj[0].numel())
                 active -= (block.mlp.n_expert - block.mlp.top_k) * per_expert
         return active
 

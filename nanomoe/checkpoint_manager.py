@@ -55,6 +55,26 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     return model_data, optimizer_data, meta_data
 
 
+_LEGACY_EXPERT = re.compile(r"^(.*\.mlp)\.experts\.(\d+)\.(c_fc|c_proj)\.weight$")
+
+
+def _stack_legacy_experts(model_data):
+    # Experts used to be a ModuleList of Linears, one state_dict entry each. They are now a
+    # single stacked Parameter per projection. Fold the old keys into the new layout so
+    # checkpoints trained before the change still load.
+    groups = {}
+    for k in list(model_data):
+        m = _LEGACY_EXPERT.match(k)
+        if m:
+            groups.setdefault((m.group(1), m.group(3)), {})[int(m.group(2))] = model_data.pop(k)
+    for (prefix, proj), by_expert in groups.items():
+        stacked = torch.stack([by_expert[i] for i in sorted(by_expert)])
+        model_data[f"{prefix}.{proj}"] = stacked
+    if groups:
+        log0(f"Stacked {len(groups)} legacy per-expert weight groups into 3D parameters")
+    return model_data
+
+
 def build_model(checkpoint_dir, step, device, phase):
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
@@ -66,6 +86,7 @@ def build_model(checkpoint_dir, step, device, phase):
         }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    model_data = _stack_legacy_experts(model_data)
     model_config_kwargs = meta_data["model_config"]
     # Drop config keys this version of GPTConfig no longer has, so checkpoints written before a
     # field was removed still load. Without this, deleting a config field orphans every

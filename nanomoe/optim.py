@@ -289,7 +289,11 @@ class MuonAdamW(torch.optim.Optimizer):
         if "momentum_buffer" not in state:
             state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
         if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+            # Keep every leading dim: a 3D expert weight (E, out, in) stacks to a 4D gradient,
+            # and a buffer built from shape[-2] alone would not broadcast against it.
+            lead = shape[:-2]
+            state_shape = ((chunk_size, *lead, shape[-2], 1) if shape[-2] >= shape[-1]
+                           else (chunk_size, *lead, 1, shape[-1]))
             state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
