@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from nanomoe.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanomoe.optim import MuonAdamW
-from nanomoe.kernels import gate_combine
+from nanomoe.kernels import gate_combine, fused_up
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanomoe.flash_attention import flash_attn
@@ -184,16 +184,17 @@ class MoEMLP(nn.Module):
         offs = torch.cumsum(counts, 0).to(torch.int32)    # group boundaries for the kernel
 
         rows = order // k                                 # token owning each sorted pair
-        xg = xf[rows]                                     # (N*k, C), expert-major order
-        # grouped_mm wants (E, K, N), i.e. the transpose of the (out, in) storage order
-        w_fc = self.c_fc.to(xg.dtype).transpose(1, 2)
-        w_proj = self.c_proj.to(xg.dtype).transpose(1, 2)
-        h = F.relu(torch._grouped_mm(xg, w_fc, offs=offs)).square()
-        y = torch._grouped_mm(h, w_proj, offs=offs)       # (N*k, C)
-
-        # fused gate-multiply + scatter-add (nanomoe/kernels.py); eager fallback off-GPU
+        # inverse permutation, shared by the fused kernels' deterministic scatter paths
+        inv = torch.empty_like(order)
+        inv[order] = torch.arange(order.numel(), device=order.device)
+        inv = inv.to(torch.int32)
+        # up-projection: gather, ragged grouped GEMM and relu^2 in one op (stage B,
+        # nanomoe/kernels.py); falls back to grouped_mm plus eager epilogue off-GPU
+        h = fused_up(xf, self.c_fc, rows, offs, inv)
+        y = torch._grouped_mm(h, self.c_proj.to(h.dtype).transpose(1, 2), offs=offs)
+        # fused gate-multiply + scatter-add (stage A); eager fallback off-GPU
         gate_o = gate.reshape(-1)[order]
-        return gate_combine(y, gate_o, order, rows, N)
+        return gate_combine(y, gate_o, order, rows, N, inv)
 
     def forward(self, x):
         B, T, C = x.shape

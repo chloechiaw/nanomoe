@@ -64,6 +64,7 @@ image = (
         "wandb>=0.21.3",
         "pyyaml>=6.0",
         "pytest>=8.0.0",
+        "quack-kernels>=0.6.4",
     )
     .env(
         {
