@@ -7,8 +7,6 @@ You can train a reasonably performing Mixture of Experts model for <$20 on 1x H1
 
 <img width="2600" height="940" alt="nanomoe_frontier" src="https://github.com/user-attachments/assets/34400ee1-1052-41c6-997c-888b22c1fee6" />
 
-The smallest category of MoEs today use is 1B active parameters (compare this with nanochat's 561M params), which means a routing experiment costs time $$ and multiple GPUs. The architecture follows a typical MoE, the only new thing I added was quantile balancing (from Jianlin Su, used in Kimi K3). This is great because we don't need to do [hyperparameter sweeps](https://openathena.ai/blog/quantile-balancing/) and also deals with load balancing.
-
 ### Setup
 
 ```bash
@@ -31,7 +29,7 @@ Downloads 120 ClimbMix shards, trains an 8192 token BPE tokenizer.
 this reproduces the run:
 
 ```bash
-modal run --detach modal_app.py::train --run nanomoe-h100 --args "--model-tag=moe-d16-h100"
+modal run --detach modal_app.py::train --run nanomoe-h100
 ```
 
 Alternatively: 
@@ -41,7 +39,6 @@ modal run --detach modal_app.py::train --run nanomoe-h100 --args \
   "--depth=16 --aspect-ratio=40 --head-dim=64 --window-pattern=L \
    --n-expert=8 --top-k=2 \
    --device-batch-size=32 --num-iterations=7350 \
-   --model-tag=moe-d16-h100 \
    --eval-every=500 --eval-tokens=10485760 \
    --core-metric-every=1500 --core-metric-max-per-task=200 \
    --expert-load-every=200 --save-every=2500"
@@ -53,12 +50,12 @@ modal run --detach modal_app.py::train --run nanomoe-h100 --args \
 modal run --detach modal_app.py::evaluate --args "--device-batch-size=8"
 ```
 
-Results land on the volume as `base_eval/base_model_<step>.csv`, one row per benchmark with
-raw and chance-centered accuracy. To find and fetch them:
+### Evaluate
+
+Scores ARC-Easy, PIQA and HellaSwag on the full test sets, plus train/val bits-per-byte.
 
 ```bash
-modal run modal_app.py::ls --path base_eval
-modal volume get nano-moe-data nanochat/base_eval/base_model_<step>.csv .
+modal run --detach modal_app.py::evaluate --args "--device-batch-size=8"
 ```
 ### Experiments / sweeps
 
@@ -67,10 +64,19 @@ sweeping is granularity: hold `top_k / n_expert` fixed so active FLOPs per token
 and vary how finely the same compute is split. `sweep.sh`:
 
 ```bash
-#!/bin/bash
+--eval core                  # benchmarks only, skip bpb
+--eval bpb                   # bpb only, ~1 min
+--max-per-task=200           # sample instead of the full test set, for a quick read
+--step=2500                  # an earlier checkpoint (default: the newest)
+--model-tag=<name>           # a specific run's checkpoint dir (default: `d<depth>`)
+```
 
-# (n_expert, top_k) at a constant 1/4 activation ratio
-configs=("8 2" "16 4" "32 8")
+Checkpoints go to `d<depth>/` on the volume unless you pass `--model-tag`. Runs at the same
+depth therefore overwrite each other, so give each point in a sweep its own tag (on both the
+train and evaluate commands).
+
+Results land on the volume as `base_eval/base_model_<step>.csv`, one row per benchmark with
+raw and chance-centered accuracy. To find and fetch them:
 
 for c in "${configs[@]}"; do
     read -r e k <<< "$c"

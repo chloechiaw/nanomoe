@@ -6,6 +6,7 @@ Run on CPU: python -m pytest tests/test_moe.py -v
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from nanomoe.gpt import GPT, GPTConfig, MLP, MoEMLP
 
@@ -61,8 +62,8 @@ def test_active_param_accounting():
     active = model.num_active_matmul_params()
     # one expert's worth of params, times the number of layers, times the inactive count
     from nanomoe.gpt import Linear
-    per_expert = sum(m.weight.numel() for m in model.transformer.h[0].mlp.experts[0].modules()
-                     if isinstance(m, Linear))
+    moe0 = model.transformer.h[0].mlp
+    per_expert = moe0.c_fc[0].numel() + moe0.c_proj[0].numel()
     expected = total - (n_expert - top_k) * per_expert * len(model.transformer.h)
     assert active == expected
     assert active < total
@@ -109,8 +110,7 @@ def test_router_receives_gradient_once_experts_are_live():
     # stand in for "one optimizer step has happened": nudge c_proj off its zero init
     with torch.no_grad():
         for block in model.transformer.h:
-            for expert in block.mlp.experts:
-                expert.c_proj.weight.normal_(std=0.02)
+            block.mlp.c_proj.normal_(std=0.02)
 
     idx = torch.randint(0, config.vocab_size, (2, config.sequence_len))
     model(idx, targets=idx).backward()
@@ -133,11 +133,10 @@ def test_expert_with_zero_tokens_still_gets_a_gradient():
     for block in model.transformer.h:
         counts = block.mlp.expert_counts
         assert counts[2:].sum() == 0, "test setup failed: experts 2+ should be starved"
-        for e, expert in enumerate(block.mlp.experts):
-            for name, p in expert.named_parameters():
-                assert p.grad is not None, f"expert {e} {name} has no grad"
+        assert block.mlp.c_fc.grad is not None, "expert c_fc has no grad"
+        assert block.mlp.c_proj.grad is not None, "expert c_proj has no grad"
         # starved experts must get exactly zero, not garbage
-        assert block.mlp.experts[3].c_fc.weight.grad.abs().sum() == 0
+        assert block.mlp.c_fc.grad[3].abs().sum() == 0
 
 
 def test_grouped_dispatch_is_dropless_under_imbalance():
@@ -146,8 +145,7 @@ def test_grouped_dispatch_is_dropless_under_imbalance():
     model = build(cfg)
     moe = model.transformer.h[0].mlp
     with torch.no_grad():
-        for e in moe.experts:
-            e.c_proj.weight.normal_(std=0.02)
+        moe.c_proj.normal_(std=0.02)
         moe.router_bias.copy_(torch.tensor([6.0, 3.0, 0, 0, 0, 0, 0, -6.0]))  # hard skew
 
     idx = torch.randint(0, cfg.vocab_size, (2, cfg.sequence_len))
@@ -161,9 +159,8 @@ def test_dispatch_matches_a_reference_dense_computation():
     torch.manual_seed(0)
     config = make_config(n_expert=6, top_k=2, n_embd=32)
     moe = MoEMLP(config)
-    for expert in moe.experts:
-        torch.nn.init.normal_(expert.c_fc.weight, std=0.1)
-        torch.nn.init.normal_(expert.c_proj.weight, std=0.1)
+    torch.nn.init.normal_(moe.c_fc, std=0.1)
+    torch.nn.init.normal_(moe.c_proj, std=0.1)
     torch.nn.init.normal_(moe.router.weight, std=0.5)
     moe.router_bias.normal_(std=0.5)
     moe.eval()
@@ -179,8 +176,9 @@ def test_dispatch_matches_a_reference_dense_computation():
     idx = topk_idx[:, :config.top_k]
     gate = torch.sigmoid(logits.gather(1, idx)).to(x.dtype)
     want = torch.zeros_like(xf)
-    for e, expert in enumerate(moe.experts):
-        y = expert(xf)
+    for e in range(config.n_expert):
+        # one expert's dense forward: relu-squared MLP with that expert's slice of the weights
+        y = F.relu(xf @ moe.c_fc[e].T).square() @ moe.c_proj[e].T
         for slot in range(config.top_k):
             sel = (idx[:, slot] == e)
             want[sel] += y[sel] * gate[sel, slot].unsqueeze(-1)
