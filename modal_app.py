@@ -96,9 +96,12 @@ app = modal.App(APP_NAME, image=image)
 data_vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 VOLUMES = {DATA_ROOT: data_vol}
 
-# Pass a local WANDB_API_KEY through if one is set; otherwise this is an empty secret and
+# The named Modal secret holds WANDB_API_KEY; fall back to passing the local env through so
 # wandb stays disabled (base_train's --run defaults to "dummy", which skips wandb entirely).
-SECRETS = [modal.Secret.from_dict({"WANDB_API_KEY": os.environ.get("WANDB_API_KEY", "")})]
+try:
+    SECRETS = [modal.Secret.from_name("wandb")]
+except Exception:
+    SECRETS = [modal.Secret.from_dict({"WANDB_API_KEY": os.environ.get("WANDB_API_KEY", "")})]
 
 
 # -----------------------------------------------------------------------------

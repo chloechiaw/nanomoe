@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from nanomoe.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanomoe.optim import MuonAdamW
-from nanomoe.kernels import gate_combine, fused_up
+from nanomoe.kernels import fused_up, fused_down
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanomoe.flash_attention import flash_attn
@@ -191,10 +191,10 @@ class MoEMLP(nn.Module):
         # up-projection: gather, ragged grouped GEMM and relu^2 in one op (stage B,
         # nanomoe/kernels.py); falls back to grouped_mm plus eager epilogue off-GPU
         h = fused_up(xf, self.c_fc, rows, offs, inv)
-        y = torch._grouped_mm(h, self.c_proj.to(h.dtype).transpose(1, 2), offs=offs)
-        # fused gate-multiply + scatter-add (stage A); eager fallback off-GPU
+        # down-projection, gate and per-token sum with an explicitly owned backward
+        # (stage B down, nanomoe/kernels.py); eager fallback off-GPU
         gate_o = gate.reshape(-1)[order]
-        return gate_combine(y, gate_o, order, rows, N, inv)
+        return fused_down(h, self.c_proj, gate_o, rows, offs, inv, N)
 
     def forward(self, x):
         B, T, C = x.shape
