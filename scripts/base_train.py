@@ -419,7 +419,7 @@ while True:
         # (acc - chance) / (1 - chance), so 0.0 means "learned nothing" on every task alike.
         raw, cen = results["results"], results["centered_results"]
         ranked = sorted(cen, key=lambda t: -cen[t])
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+        print0(f"Step {step:05d} | mean centered (3 benchmarks): {results['mean_centered']:.4f}")
         print0(f"  {'task':34s} {'type':4s} {'raw acc':>8s} {'chance':>7s} {'centered':>9s}")
         for t in ranked:
             a, c = raw[t], cen[t]
@@ -432,7 +432,7 @@ while True:
         core_log = {
             "step": step,
             "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
+            "mean_centered_3": results["mean_centered"],
             "core/n_tasks_with_signal": n_signal,
         }
         for t in cen:

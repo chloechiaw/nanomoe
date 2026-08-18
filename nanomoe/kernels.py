@@ -194,9 +194,90 @@ if HAS_QUACK:
 
 def fused_up(xf, w_fc, rows, offs, inv):
     """h = relu(xf[rows] @ w_fc[e].T)^2, grouped by expert. w_fc is (E, d_ff, C)."""
-    if HAS_QUACK and xf.is_cuda:
+    # QuACK compiles per input shape, which is perfect for training (one fixed shape) and
+    # pathological for benchmark eval (every batch a new shape, minutes of CuTe compilation
+    # each). No-grad forwards take the shape-tolerant CUTLASS path instead.
+    if HAS_QUACK and xf.is_cuda and torch.is_grad_enabled():
         offs0 = torch.cat([offs.new_zeros(1), offs])
         return torch.ops.nanomoe.quack_up(xf, w_fc, rows.to(torch.int32), offs0, inv)
     import torch.nn.functional as F
     xg = xf[rows]
     return F.relu(torch._grouped_mm(xg, w_fc.to(xg.dtype).transpose(1, 2), offs=offs)).square()
+
+
+# -----------------------------------------------------------------------------
+# Stage B, down half: y = h @ W2[e].T scaled by the gate and summed per token, with the
+# whole backward owned explicitly instead of left to _grouped_mm's autograd.
+#
+# The forward is structurally unchanged (the scatter cannot move into the GEMM's store
+# without atomics, and even sonic-moe keeps an expanded output plus a reduction kernel).
+# The win is the backward: one kernel yields dy and dgate together, then dh and dW2 are
+# two explicit QuACK GEMMs. dW2 uses the same varlen-K pattern as dW1, so no transposed
+# copy of h is ever made.
+
+if HAS_QUACK:
+
+    @torch.library.custom_op("nanomoe::quack_down", mutates_args=())
+    def _quack_down_op(h: torch.Tensor, w2: torch.Tensor, gate_o: torch.Tensor,
+                       rows: torch.Tensor, offs0: torch.Tensor,
+                       inv: torch.Tensor, n_tokens: int) -> list[torch.Tensor]:
+        C = w2.shape[1]
+        w2b = w2.to(h.dtype)
+        # B is (E, K=DFF, N=C): the transpose view of the (E, C, DFF) storage order
+        y = _qk_gemm(h, w2b.permute(0, 2, 1), cu_seqlens_m=offs0)
+        out = torch.empty(n_tokens, C, device=h.device, dtype=h.dtype)
+        _combine_fwd[(n_tokens, triton.cdiv(C, 256))](
+            y, gate_o, inv, out, C, K=inv.numel() // n_tokens, BLOCK_C=256)
+        return [out, y]
+
+    @_quack_down_op.register_fake
+    def _(h, w2, gate_o, rows, offs0, inv, n_tokens):
+        return [h.new_empty(n_tokens, w2.shape[1]), h.new_empty(h.shape[0], w2.shape[1])]
+
+    @torch.library.custom_op("nanomoe::quack_down_bwd", mutates_args=())
+    def _quack_down_bwd_op(dout: torch.Tensor, y: torch.Tensor, h: torch.Tensor,
+                           w2: torch.Tensor, gate_o: torch.Tensor, rows: torch.Tensor,
+                           offs0: torch.Tensor) -> list[torch.Tensor]:
+        E, C, DFF = w2.shape
+        P = y.shape[0]
+        w2b = w2.to(dout.dtype)
+        # dy = gate * dout[rows] and dgate = <dout[rows], y>, one pass
+        dy = torch.empty_like(y)
+        dgate = torch.empty(P, device=y.device, dtype=torch.float32)
+        _combine_bwd[(P,)](dout.contiguous(), y, gate_o, rows, dy, dgate, C, BLOCK_C=256)
+        # dh per pair: dy @ W2[e]; W2 is already (E, K=C, N=DFF)
+        dh = _qk_gemm(dy, w2b, cu_seqlens_m=offs0)
+        # dW2[e] = dy_e^T @ h_e: varlen along the reduction dim, written in native layout
+        dw2 = torch.empty(E, C, DFF, device=h.device, dtype=torch.float32)
+        _qk_gemm(dy.T, h, out=dw2, cu_seqlens_k=offs0)
+        return [dh, dw2, dgate.to(gate_o.dtype)]
+
+    @_quack_down_bwd_op.register_fake
+    def _(dout, y, h, w2, gate_o, rows, offs0):
+        return [torch.empty_like(h), h.new_empty(w2.shape, dtype=torch.float32),
+                torch.empty_like(gate_o)]
+
+    def _quack_down_setup(ctx, inputs, output):
+        h, w2, gate_o, rows, offs0, inv, n_tokens = inputs
+        ctx.save_for_backward(h, w2, gate_o, rows, offs0, output[1])
+
+    def _quack_down_backward(ctx, grads):
+        dout, _ = grads
+        h, w2, gate_o, rows, offs0, y = ctx.saved_tensors
+        dh, dw2, dgate = torch.ops.nanomoe.quack_down_bwd(dout, y, h, w2, gate_o, rows, offs0)
+        return dh, dw2, dgate, None, None, None, None
+
+    _quack_down_op.register_autograd(_quack_down_backward, setup_context=_quack_down_setup)
+
+
+def fused_down(h, w2, gate_o, rows, offs, inv, n_tokens):
+    """out[t] = sum over token t's pairs of gate * (h @ w2[e].T). w2 is (E, C, d_ff)."""
+    if HAS_QUACK and h.is_cuda and torch.is_grad_enabled():
+        offs0 = torch.cat([offs.new_zeros(1), offs])
+        out, _ = torch.ops.nanomoe.quack_down(h, w2, gate_o, rows.to(torch.int32),
+                                              offs0, inv, n_tokens)
+        return out
+    y = torch._grouped_mm(h, w2.to(h.dtype).transpose(1, 2), offs=offs)
+    out = torch.zeros(n_tokens, y.shape[1], device=y.device, dtype=y.dtype)
+    out.index_add_(0, rows, y * gate_o.unsqueeze(-1))
+    return out
