@@ -1,20 +1,4 @@
-"""
-Hand-written Triton kernels for the MoE hot path.
-
-Stage A: the combine. After the expert GEMMs produce y (one row per routed (token, expert)
-pair, in expert-major order), the eager tail was three kernels:
-
-    y = y * gate_o.unsqueeze(-1)      # read y, read gate, write y'
-    out = torch.zeros_like(xf)        # write zeros
-    out.index_add_(0, rows, y)        # read y', read+write out
-
-This file does it in one kernel each way. The forward iterates tokens rather than pairs:
-token t's k contributions sit at sorted positions inv[t*k + s], so each output row is a
-plain sum of k loads. No atomics, so runs are deterministic.
-
-Triton only exists on CUDA, and the tests run on CPU, so every entry point falls back to
-the eager formulation off-GPU. The eager path is also the correctness reference.
-"""
+"""Triton and QuACK kernels for the MoE hot path."""
 
 import torch
 
@@ -24,6 +8,11 @@ try:
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
+
+
+# --------------------------------------------------------------------------------------------------
+# ------------------ Combine kernels: gate multiply + deterministic per-token sum ------------------
+# --------------------------------------------------------------------------------------------------
 
 
 if HAS_TRITON:
@@ -59,64 +48,11 @@ if HAS_TRITON:
             acc += do * yv
         tl.store(dgate_ptr + p, tl.sum(acc, axis=0))
 
-    @torch.library.triton_op("nanomoe::gate_combine", mutates_args={})
-    def _gate_combine_op(y: torch.Tensor, gate_o: torch.Tensor, inv: torch.Tensor,
-                         rows: torch.Tensor, n_tokens: int) -> torch.Tensor:
-        C = y.shape[1]
-        K = inv.numel() // n_tokens
-        out = torch.empty(n_tokens, C, device=y.device, dtype=y.dtype)
-        torch.library.wrap_triton(_combine_fwd)[(n_tokens, triton.cdiv(C, 256))](y, gate_o, inv, out, C, K=K, BLOCK_C=256)
-        return out
-
-    @_gate_combine_op.register_fake
-    def _(y, gate_o, inv, rows, n_tokens):
-        return y.new_empty(n_tokens, y.shape[1])
-
-    def _gate_combine_setup(ctx, inputs, output):
-        y, gate_o, inv, rows, n_tokens = inputs
-        ctx.save_for_backward(y, gate_o, rows)
-
-    def _gate_combine_bwd(ctx, dout):
-        y, gate_o, rows = ctx.saved_tensors
-        P, C = y.shape
-        dy = torch.empty_like(y)
-        dgate = torch.empty(P, device=y.device, dtype=torch.float32)
-        torch.library.wrap_triton(_combine_bwd)[(P,)](dout.contiguous(), y, gate_o, rows, dy, dgate, C, BLOCK_C=256)
-        return dy, dgate.to(gate_o.dtype), None, None, None
-
-    _gate_combine_op.register_autograd(_gate_combine_bwd, setup_context=_gate_combine_setup)
 
 
-def gate_combine(y, gate_o, order, rows, n_tokens, inv=None):
-    """out[t] = sum over the k pairs routed from token t of gate * expert output."""
-    if HAS_TRITON and y.is_cuda:
-        # inv[p_orig] = sorted position of original pair p_orig, so token t's contributions
-        # are at inv[t*k + s]. Deterministic sum instead of index_add_'s atomics.
-        if inv is None:
-            inv = torch.empty_like(order)
-            inv[order] = torch.arange(order.numel(), device=order.device)
-            inv = inv.to(torch.int32)
-        return torch.ops.nanomoe.gate_combine(y, gate_o, inv, rows.to(torch.int32), n_tokens)
-    out = torch.zeros(n_tokens, y.shape[1], device=y.device, dtype=y.dtype)
-    out.index_add_(0, rows, y * gate_o.unsqueeze(-1))
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Stage B: the up-projection, h = relu(xf[rows] @ W1[e].T)^2, on QuACK's grouped GEMMs.
-#
-# A hand-written Triton version of this lost to CUTLASS end-to-end (27.3% vs 30.5% MFU): the
-# fused forward won but the hand dW kernel gave it all back. Lesson applied here, the same
-# one sonic-moe's architecture teaches: never author the GEMM core. QuACK (Dao-AILab) exposes
-# everything this needs as arguments: relu_sq as a registered epilogue, cu_seqlens_m for the
-# ragged expert segments, A_idx to fuse the gather, and cu_seqlens_k + A_idx for the dW GEMM
-# that reduces over each expert's pairs.
-#
-# Backward never sees the pre-activation: relu(s) = sqrt(h) wherever h > 0, so
-# ds = dh * 2*sqrt(h) comes from the output we keep anyway.
-#
-# Both directions are wrapped as opaque custom ops so neither dynamo nor AOTAutograd ever
-# traces QuACK's python (autotuner and all); they only see two graph nodes with fake impls.
+# --------------------------------------------------------------------------------------------------
+# ----------------- Up projection: gather + grouped GEMM + relu^2, one QuACK call ------------------
+# --------------------------------------------------------------------------------------------------
 
 try:
     from quack.gemm_interface import gemm as _qk_gemm, gemm_act as _qk_gemm_act
@@ -128,9 +64,7 @@ if HAS_TRITON:
 
     @triton.jit
     def _drelu_sq(dh_ptr, h_ptr, ds_ptr, numel, BLOCK: tl.constexpr):
-        # ds = dh * 2*sqrt(h): relu(s) = sqrt(h) wherever h > 0, so this is the whole
-        # relu^2 backward in one pass. Lives here because it runs inside an opaque custom
-        # op where Inductor cannot fuse eager elementwise chains.
+        # relu^2 backward in one pass: relu(s) = sqrt(h) wherever h > 0, so ds = dh * 2*sqrt(h)
         i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         m = i < numel
         dh = tl.load(dh_ptr + i, mask=m, other=0.0).to(tl.float32)
@@ -194,9 +128,8 @@ if HAS_QUACK:
 
 def fused_up(xf, w_fc, rows, offs, inv):
     """h = relu(xf[rows] @ w_fc[e].T)^2, grouped by expert. w_fc is (E, d_ff, C)."""
-    # QuACK compiles per input shape, which is perfect for training (one fixed shape) and
-    # pathological for benchmark eval (every batch a new shape, minutes of CuTe compilation
-    # each). No-grad forwards take the shape-tolerant CUTLASS path instead.
+    # QuACK JIT-compiles per shape: ideal for training (one shape), pathological for eval
+    # (every batch a new shape). No-grad forwards take the shape-tolerant CUTLASS path.
     if HAS_QUACK and xf.is_cuda and torch.is_grad_enabled():
         offs0 = torch.cat([offs.new_zeros(1), offs])
         return torch.ops.nanomoe.quack_up(xf, w_fc, rows.to(torch.int32), offs0, inv)
@@ -205,15 +138,9 @@ def fused_up(xf, w_fc, rows, offs, inv):
     return F.relu(torch._grouped_mm(xg, w_fc.to(xg.dtype).transpose(1, 2), offs=offs)).square()
 
 
-# -----------------------------------------------------------------------------
-# Stage B, down half: y = h @ W2[e].T scaled by the gate and summed per token, with the
-# whole backward owned explicitly instead of left to _grouped_mm's autograd.
-#
-# The forward is structurally unchanged (the scatter cannot move into the GEMM's store
-# without atomics, and even sonic-moe keeps an expanded output plus a reduction kernel).
-# The win is the backward: one kernel yields dy and dgate together, then dh and dW2 are
-# two explicit QuACK GEMMs. dW2 uses the same varlen-K pattern as dW1, so no transposed
-# copy of h is ever made.
+# --------------------------------------------------------------------------------------------------
+# ----------- Down projection: grouped GEMM + gate + combine, backward owned explicitly ------------
+# --------------------------------------------------------------------------------------------------
 
 if HAS_QUACK:
 

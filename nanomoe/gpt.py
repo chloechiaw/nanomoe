@@ -172,10 +172,6 @@ class MoEMLP(nn.Module):
         self.register_buffer("expert_counts", torch.zeros(config.n_expert, dtype=torch.long), persistent=False)
 
     def _dispatch_grouped(self, xf, idx, gate):
-        # Sort the (token, expert) pairs by expert, then run every expert in a single grouped
-        # GEMM. The kernel takes per-expert group boundaries, so the groups can be different
-        # sizes: no padding, no capacity limit, and nothing is dropped. Needs a Hopper GPU.
-
         N, C = xf.shape
         E, k = self.n_expert, self.top_k
         flat = idx.reshape(-1)
